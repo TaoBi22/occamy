@@ -10,11 +10,12 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).parent / '../../deps/snitch_cluster/util/sim'))
 from sim_utils import parser, get_simulations, run_simulations  # noqa: E402
-from Simulator import QuestaSimulator  # noqa: E402
+from Simulator import QuestaSimulator, VCSSimulator  # noqa: E402
 
 
 SIMULATORS = {
-    'vsim': QuestaSimulator(Path(__file__).parent.resolve() / 'bin/occamy_top.vsim')
+    'vsim': QuestaSimulator(Path(__file__).parent.resolve() / 'bin/occamy_top.vsim'),
+    'vcs': VCSSimulator(Path(__file__).parent.resolve() / 'bin/occamy_top.vcs')
 }
 
 
