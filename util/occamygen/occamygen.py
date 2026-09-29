@@ -12,6 +12,8 @@ import re
 import logging
 from subprocess import run
 import csv
+import fnmatch
+import json
 
 from jsonref import JsonRef
 from occamy import Occamy
@@ -105,6 +107,16 @@ def main():
     parser.add_argument("--am-csv", "-aml", metavar="ADDRMAP_CSV")
     parser.add_argument("--dts", metavar="DTS", help="System's device tree.")
     parser.add_argument("--name", metavar="NAME", default=DEFAULT_NAME, help="System's name.")
+    parser.add_argument("--axi4-xbars",
+                        metavar="XBARS",
+                        default="",
+                        help="Comma-separated crossbar names (globs allowed) to generate "
+                        "with the CIRCT AXI4 dialect.")
+    parser.add_argument("--axi4-mlir",
+                        metavar="MLIR",
+                        type=pathlib.Path,
+                        help="Write the AXI4-dialect crossbars here, and their expected ports "
+                        "next to it as JSON.")
 
     parser.add_argument("-v",
                         "--verbose",
@@ -681,6 +693,17 @@ def main():
                                                     "S1QuadrantCfgAddressSpace")])
         soc_narrow_xbar.add_input("s1_quadrant_{}".format(i))
 
+    # The same quadrant windows as constants, for the AXI4 dialect.
+    cfg_base = occamy.cfg["s1_quadrant"]["cfg_base_addr"]
+    cfg_size = occamy.cfg["s1_quadrant"]["cfg_base_offset"]
+    soc_narrow_xbar.axi4_addrmap = [
+        rule for i in range(nr_s1_quadrants)
+        for idx in [soc_narrow_xbar.outputs.index("s1_quadrant_{}".format(i))]
+        for rule in [(idx, cluster_base_addr + i * quadrant_size,
+                      cluster_base_addr + (i + 1) * quadrant_size),
+                     (idx, cfg_base + i * cfg_size, cfg_base + (i + 1) * cfg_size)]
+    ]
+
     soc_narrow_xbar.add_input("cva6")
     soc_narrow_xbar.add_input("soc_wide")
     soc_narrow_xbar.add_input("periph")
@@ -836,8 +859,24 @@ def main():
         rmq_demux[i].add_output("narrow")
         rmq_demux[i].add_output("wide")
 
+    # Select the crossbars generated with the AXI4 dialect.
+    for pattern in filter(None, args.axi4_xbars.split(",")):
+        matches = [x for x in solder.xbars if fnmatch.fnmatchcase(x.name, pattern.strip())]
+        if not matches:
+            exit("No crossbar matches `{}`.".format(pattern))
+        for x in matches:
+            if not isinstance(x, solder.AxiXbar):
+                exit("`{}` is not an AXI crossbar.".format(x.name))
+            x.axi4_dialect = True
+
     # Generate the Verilog code.
     solder.render()
+
+    if args.axi4_mlir:
+        with open(args.axi4_mlir, "w") as f:
+            f.write(solder.code_axi4_mlir.lstrip())
+        with open(args.axi4_mlir.with_suffix(".json"), "w") as f:
+            json.dump(solder.axi4_ports, f, indent=2)
 
     ###############
     # HBM APB CTL #

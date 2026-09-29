@@ -5,6 +5,7 @@
 /work-vsim/
 /*.log
 /.*_targets_group
+/.axi4_xbars
 /sw/**/build/
 /runs/
 

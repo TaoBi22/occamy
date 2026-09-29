@@ -208,15 +208,35 @@ MISC_OCCAMYGEN_SV_TEMPLATES += $(SOURCE_OCCAMY_DIR)/occamy_cva6.sv.tpl
 MISC_OCCAMYGEN_SV_TARGETS  = $(addprefix $(TARGET_SRC_DIR)/,$(notdir $(basename $(MISC_OCCAMYGEN_SV_TEMPLATES))))
 MISC_OCCAMYGEN_SV_TARGETS += $(TARGET_SRC_DIR)/occamy_cluster_wrapper.sv
 
+# Crossbars generated with the CIRCT AXI4 dialect (empty for all handwritten), and optionally a
+# previously lowered SV file
+AXI4_XBARS    ?= quadrant_pre_xbar_*,quadrant_inter_xbar,soc_wide_xbar,soc_narrow_xbar
+AXI4_XBARS_SV ?=
+CIRCT_OPT     ?= circt-opt
+AXI4_LOWER    ?= $(ROOT)/util/occamygen/axi4_lower.py
+AXI4_MLIR      = $(TARGET_SRC_DIR)/occamy_axi4_xbars.mlir
+AXI4_SV        = $(TARGET_SRC_DIR)/occamy_axi4_xbars.sv
+
 MISC_OCCAMYGEN_TARGETS  = $(MISC_OCCAMYGEN_SV_TARGETS)
 MISC_OCCAMYGEN_TARGETS += $(TARGET_SRC_DIR)/occamy_memories.json
+MISC_OCCAMYGEN_TARGETS += $(AXI4_MLIR)
 
-soc: $(MISC_OCCAMYGEN_TARGETS)
+soc: $(MISC_OCCAMYGEN_TARGETS) $(AXI4_SV)
 clean-soc:
 	rm -rf $(MISC_OCCAMYGEN_TARGETS) .misc_occamygen_targets_group
+	rm -rf $(AXI4_SV) $(AXI4_MLIR:.mlir=.json) $(TARGET_SRC_DIR)/axi4 .axi4_xbars
+
+# Regenerate when the selection changes.
+.axi4_xbars: FORCE
+	@echo '$(AXI4_XBARS)' | cmp -s - $@ || echo '$(AXI4_XBARS)' > $@
+
+$(AXI4_SV): $(AXI4_MLIR) $(AXI4_LOWER) $(AXI4_XBARS_SV)
+	@echo "[CIRCT] Generate $@"
+	@$(AXI4_LOWER) --mlir $< --out $@ --workdir $(TARGET_SRC_DIR)/axi4 --circt-opt $(CIRCT_OPT) \
+		$(if $(AXI4_XBARS_SV),--prebuilt $(AXI4_XBARS_SV))
 
 $(MISC_OCCAMYGEN_TARGETS): .misc_occamygen_targets_group
-.misc_occamygen_targets_group: $(CFG) $(MISC_OCCAMYGEN_SV_TEMPLATES)
+.misc_occamygen_targets_group: $(CFG) $(MISC_OCCAMYGEN_SV_TEMPLATES) .axi4_xbars
 	@echo "[OCCAMYGEN] Generate $(MISC_OCCAMYGEN_TARGETS)"
 	@$(OCCAMYGEN) --cfg $(CFG) --outdir $(TARGET_SRC_DIR)\
 		--wrapper \
@@ -227,7 +247,9 @@ $(MISC_OCCAMYGEN_TARGETS): .misc_occamygen_targets_group
 		--quadrant-s1      $(SOURCE_OCCAMY_DIR)/occamy_quadrant_s1.sv.tpl \
 		--quadrant-s1-ctrl $(SOURCE_OCCAMY_DIR)/occamy_quadrant_s1_ctrl.sv.tpl \
 		--xilinx-sv        $(SOURCE_OCCAMY_DIR)/occamy_xilinx.sv.tpl \
-		--cva6-sv          $(SOURCE_OCCAMY_DIR)/occamy_cva6.sv.tpl
+		--cva6-sv          $(SOURCE_OCCAMY_DIR)/occamy_cva6.sv.tpl \
+		--axi4-xbars       '$(AXI4_XBARS)' \
+		--axi4-mlir        $(AXI4_MLIR)
 	@$(VERIBLE_FMT) --inplace $(MISC_OCCAMYGEN_SV_TARGETS)
 	@touch $@
 

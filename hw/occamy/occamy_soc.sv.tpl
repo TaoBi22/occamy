@@ -40,6 +40,7 @@
   hbi_trunc_addr_width = 40
 %>
 
+`include "common_cells/assertions.svh"
 `include "common_cells/registers.svh"
 `include "register_interface/typedef.svh"
 `include "axi/assign.svh"

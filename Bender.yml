@@ -93,6 +93,7 @@ sources:
       - target/sim/src/occamy_pkg.sv
       - target/sim/src/occamy_quadrant_s1_ctrl.sv
       - target/sim/src/occamy_quadrant_s1.sv
+      - target/sim/src/occamy_axi4_xbars.sv
       - target/sim/src/occamy_soc.sv
       - target/sim/src/occamy_top.sv
       - target/sim/src/occamy_cva6.sv
