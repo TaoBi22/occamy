@@ -1482,6 +1482,9 @@ class AxiXbar(Xbar):
         self.axi4_dialect = False
         # Constant rules standing in for the symbolic ones.
         self.axi4_addrmap = None
+        # Generate one crossbar per value of a module parameter: `param`, the signal that must
+        # equal it (`signal`), and the constant stand-in rules for each value (`addrmaps`).
+        self.axi4_variants = None
 
     def add_input(self, name, outputs=None):
         self.inputs.append(name)
@@ -1519,12 +1522,17 @@ class AxiXbar(Xbar):
     def iw_out(self):
         return self.iw + int(math.ceil(math.log2(max(1, len(self.inputs)))))
 
-    def axi4_module(self):
-        return "{}_axi4".format(self.name)
+    def axi4_module(self, variant=None):
+        if variant is None:
+            return "{}_axi4".format(self.name)
+        return "{}_{}{}_axi4".format(self.name, self.axi4_variants["param"].lower(), variant)
 
     def axi4_modules(self):
         """Generated modules and the address map of each."""
-        return [(self.axi4_module(), self.addrmap + (self.axi4_addrmap or []))]
+        if self.axi4_variants is None:
+            return [(self.axi4_module(), self.addrmap + (self.axi4_addrmap or []))]
+        return [(self.axi4_module(k), self.addrmap + m)
+                for k, m in enumerate(self.axi4_variants["addrmaps"])]
 
     @staticmethod
     def axi4_req_resp_bits(aw, dw, iw, uw):
@@ -1568,7 +1576,8 @@ class AxiXbar(Xbar):
         global code_axi4_mlir
         unsupported = []
         # Constant maps stand in for a symbolic one.
-        if (self.symbolic_addrmap or self.symbolic_addrmap_multi) and self.axi4_addrmap is None:
+        if (self.symbolic_addrmap or self.symbolic_addrmap_multi) and \
+                self.axi4_variants is None and self.axi4_addrmap is None:
             unsupported.append("symbolic address maps")
         if self.interleaved_ena:
             unsupported.append("interleaved mode")
@@ -1657,7 +1666,21 @@ class AxiXbar(Xbar):
             ports.append("  .out_{n}_req ( {x}_out_req[{e}] )".format(n=name, x=self.name, e=enum))
             ports.append("  .out_{n}_resp ( {x}_out_rsp[{e}] )".format(n=name, x=self.name, e=enum))
         ports = ",\n".join(ports)
-        return code + "{} i_{} (\n{}\n);\n".format(self.axi4_module(), self.name, ports)
+        if self.axi4_variants is None:
+            return code + "{} i_{} (\n{}\n);\n".format(self.axi4_module(), self.name, ports)
+
+        # One generated crossbar per value of the parameter, each with that value's address map.
+        param = self.axi4_variants["param"]
+        code += "`ASSERT({}{}, {} == {}, {}, !{})\n".format(
+            pascal, param, self.axi4_variants["signal"], param, self.clk, self.rst)
+        code += "case ({})\n".format(param)
+        for k in range(len(self.axi4_variants["addrmaps"])):
+            code += "  {}: begin : gen_{}\n{} i_{} (\n{}\n);\n  end\n".format(
+                k, self.axi4_module(k)[:-len("_axi4")], self.axi4_module(k), self.name, ports)
+        code += "  default: begin : gen_{}_unsupported\n" \
+            "    initial $fatal(1, \"No generated {} for {} %0d\", {});\n  end\n" \
+            "endcase\n".format(self.name, self.name, param, param)
+        return code
 
     def emit(self):
         global code_module

@@ -18,10 +18,14 @@
   wide_tlb_entries = wide_tlb_cfg.get("l1_num_entries", 1)
 %>
 
+`include "common_cells/assertions.svh"
+
 module ${name}_quadrant_s1_ctrl
   import ${name}_pkg::*;
   import ${name}_quadrant_s1_reg_pkg::*;
 #(
+  /// Must equal `tile_id_i`; selects the generated crossbars.
+  parameter tile_id_t TileId = '0,
   parameter type tlb_entry_t = logic
 )(
   input  logic clk_i,

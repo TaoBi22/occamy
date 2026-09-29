@@ -210,7 +210,8 @@ MISC_OCCAMYGEN_SV_TARGETS += $(TARGET_SRC_DIR)/occamy_cluster_wrapper.sv
 
 # Crossbars generated with the CIRCT AXI4 dialect (empty for all handwritten), and optionally a
 # previously lowered SV file
-AXI4_XBARS    ?= quadrant_pre_xbar_*,quadrant_inter_xbar,soc_wide_xbar,soc_narrow_xbar
+AXI4_XBARS    ?= quadrant_pre_xbar_*,quadrant_inter_xbar,soc_wide_xbar,soc_narrow_xbar,\
+                 wide_xbar_quadrant_s1,narrow_xbar_quadrant_s1,quadrant_s1_ctrl_*_xbar
 AXI4_XBARS_SV ?=
 CIRCT_OPT     ?= circt-opt
 AXI4_LOWER    ?= $(ROOT)/util/occamygen/axi4_lower.py

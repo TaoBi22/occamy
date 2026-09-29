@@ -226,7 +226,9 @@ module ${name}_soc
       .cut(context, cuts_pre_to_hbmx, name="pre_to_hbm_cut_{}".format(i), to=hbm_xbar.__dict__["in_quadrant_{}".format(i)])
   %>\
 
-  ${name}_quadrant_s1 i_${name}_quadrant_s1_${i} (
+  ${name}_quadrant_s1 #(
+    .TileId (6'd${i})
+  ) i_${name}_quadrant_s1_${i} (
     .clk_i (clk_i),
     .rst_ni (rst_ni),
     .test_mode_i (test_mode_i),

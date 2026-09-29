@@ -760,6 +760,14 @@ def main():
         quadrant_s1_ctrl_xbars[name].add_output_symbolic("internal",
                                                          "internal_xbar_base_addr",
                                                          "S1QuadrantCfgAddressSpace")
+        # The same window, constant per tile, for the AXI4 dialect.
+        xbar = quadrant_s1_ctrl_xbars[name]
+        xbar.axi4_variants = {
+            "param": "TileId",
+            "signal": "tile_id_i",
+            "addrmaps": [[(xbar.outputs.index("internal"), cfg_base + t * cfg_size,
+                           cfg_base + (t + 1) * cfg_size)] for t in range(nr_s1_quadrants)]
+        }
 
     # AXI Lite mux to combine register requests
     quadrant_s1_ctrl_mux = solder.AxiLiteXbar(
@@ -828,6 +836,22 @@ def main():
                                                     "cluster_base_addr",
                                                     "ClusterAddressSpace")
         narrow_xbar_quadrant_s1.add_input("cluster_{}".format(i))
+
+    # The same cluster address maps, constant per tile, for the AXI4 dialect.
+    def cluster_addrmap(xbar, tile):
+        addrmap = []
+        for j in range(nr_s1_clusters):
+            base = cluster_base_addr + (tile * nr_s1_clusters + j) * cluster_base_offset
+            addrmap.append((xbar.outputs.index("cluster_{}".format(j)), base,
+                            base + cluster_base_offset))
+        return addrmap
+
+    for xbar in (wide_xbar_quadrant_s1, narrow_xbar_quadrant_s1):
+        xbar.axi4_variants = {
+            "param": "TileId",
+            "signal": "tile_id_i",
+            "addrmaps": [cluster_addrmap(xbar, t) for t in range(nr_s1_quadrants)]
+        }
 
     # remote downstream mux
     rmq_mux = [None]*max(nr_remote_quadrants, 1 if is_remote_quadrant else 0)

@@ -27,11 +27,15 @@
 
 `include "axi/typedef.svh"
 `include "axi_tlb/typedef.svh"
+`include "common_cells/assertions.svh"
 
 /// Occamy Stage 1 Quadrant
 module ${name}_quadrant_s1
   import ${name}_pkg::*;
-(
+#(
+  /// Must equal `tile_id_i`; selects the generated crossbars.
+  parameter tile_id_t TileId = '0
+)(
   input  logic                         clk_i,
   input  logic                         rst_ni,
   input  logic                         test_mode_i,
@@ -180,6 +184,7 @@ module ${name}_quadrant_s1
   /////////////////////////
 
   ${name}_quadrant_s1_ctrl #(
+    .TileId (TileId),
     .tlb_entry_t (tlb_entry_t)
   ) i_${name}_quadrant_s1_ctrl (
     .clk_i,
