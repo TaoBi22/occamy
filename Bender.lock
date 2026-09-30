@@ -163,10 +163,10 @@ packages:
       Git: https://github.com/pulp-platform/scm.git
     dependencies: []
   snitch_cluster:
-    revision: da57b043dfe0ba563a55a9d83bf362873c713648
+    revision: 6a40b0c0d157a03a8add356277f33447e6a8ebd3
     version: null
     source:
-      Git: https://github.com/pulp-platform/snitch_cluster.git
+      Git: https://github.com/TaoBi22/snitch_cluster.git
     dependencies:
     - axi
     - axi_riscv_atomics

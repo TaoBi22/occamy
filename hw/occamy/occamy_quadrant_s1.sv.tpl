@@ -234,7 +234,9 @@ module ${name}_quadrant_s1
   logic [9:0] hart_base_id_${i};
   assign hart_base_id_${i} = HartIdOffset + tile_id_i * NrCoresS1Quadrant + ${i} * NrCoresCluster;
 
-  ${name}_cluster_wrapper i_${name}_cluster_${i} (
+  ${name}_cluster_wrapper #(
+    .ClusterBaseAddr (ClusterBaseOffset + TileId * NrClustersS1Quadrant * ClusterAddressSpace + ${i} * ClusterAddressSpace)
+  ) i_${name}_cluster_${i} (
     .clk_i (clk_quadrant),
     .rst_ni (rst_quadrant_n),
     .meip_i (meip_i[${i}*NrCoresCluster+:NrCoresCluster]),
