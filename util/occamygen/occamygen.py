@@ -27,6 +27,8 @@ re_trailws = re.compile(r'[ \t\r]+$', re.MULTILINE)
 
 # Default name for all generated sources
 DEFAULT_NAME = "occamy"
+# Networks `--axi4-networks` can select.
+AXI4_NETWORKS = ["soc_narrow"]
 
 
 def write_template(tpl_path, outdir, fname=None, **kwargs):
@@ -112,6 +114,11 @@ def main():
                         default="",
                         help="Comma-separated crossbar names (globs allowed) to generate "
                         "with the CIRCT AXI4 dialect.")
+    parser.add_argument("--axi4-networks",
+                        metavar="NETWORKS",
+                        default="",
+                        help="Comma-separated networks of crossbars to generate as one "
+                        "AXI4-dialect module each: {}.".format(", ".join(AXI4_NETWORKS)))
     parser.add_argument("--axi4-mlir",
                         metavar="MLIR",
                         type=pathlib.Path,
@@ -883,6 +890,29 @@ def main():
         rmq_demux[i].add_output("narrow")
         rmq_demux[i].add_output("wide")
 
+    # Networks of crossbars generated as one AXI4-dialect module each, with the cuts on their
+    # boundary ports that sit next to a crossbar in the templates.
+    cuts = occamy.cfg["cuts"]
+    soc_narrow = solder.Axi4Network("soc_narrow", "soc", [soc_narrow_xbar])
+    for i in range(nr_s1_quadrants):
+        soc_narrow.add_cuts(soc_narrow_xbar, "out_s1_quadrant_{}".format(i), cuts["narrow_to_quad"])
+        soc_narrow.add_cuts(soc_narrow_xbar, "in_s1_quadrant_{}".format(i), cuts["quad_to_narrow"])
+    soc_narrow.add_cuts(soc_narrow_xbar, "in_cva6", cuts["narrow_to_cva6"])
+    soc_narrow.add_cuts(soc_narrow_xbar, "in_soc_wide", cuts["narrow_and_wide"])
+    soc_narrow.add_cuts(soc_narrow_xbar, "in_periph", cuts["periph_axi_lite"])
+    soc_narrow.add_cuts(soc_narrow_xbar, "in_pcie", cuts["narrow_and_pcie"])
+    soc_narrow.add_cuts(soc_narrow_xbar, "in_hbi", cuts["narrow_and_hbi"])
+    soc_narrow.add_cuts(soc_narrow_xbar, "out_spm_narrow", cuts["narrow_conv_to_spm_narrow_pre"])
+    networks = {"soc_narrow": soc_narrow}
+    assert set(networks) == set(AXI4_NETWORKS)
+
+    axi4_networks = set()
+    for name in filter(None, (n.strip() for n in args.axi4_networks.split(","))):
+        if name not in networks:
+            exit("No network `{}`.".format(name))
+        networks[name].select()
+        axi4_networks.add(name)
+
     # Select the crossbars generated with the AXI4 dialect.
     for pattern in filter(None, args.axi4_xbars.split(",")):
         matches = [x for x in solder.xbars if fnmatch.fnmatchcase(x.name, pattern.strip())]
@@ -944,7 +974,8 @@ def main():
         "hbm_channel_size": hbm_channel_size,
         "nr_hbm_channels": nr_hbm_channels,
         "rmq_mux": rmq_mux,
-        "rmq_demux": rmq_demux
+        "rmq_demux": rmq_demux,
+        "axi4_networks": axi4_networks
     }
 
     # Emit the code.

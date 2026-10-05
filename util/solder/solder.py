@@ -23,6 +23,8 @@ code_module = dict()
 code_axi4_mlir = ""
 # Expected ports of those crossbars, by module.
 axi4_ports = dict()
+# Networks of crossbars generated as one AXI4-dialect module each.
+networks = list()
 
 
 # An address map.
@@ -1485,6 +1487,8 @@ class AxiXbar(Xbar):
         # Generate one crossbar per value of a module parameter: `param`, the signal that must
         # equal it (`signal`), and the constant stand-in rules for each value (`addrmaps`).
         self.axi4_variants = None
+        # The `Axi4Network` generating this crossbar.
+        self.axi4_network = None
 
     def add_input(self, name, outputs=None):
         self.inputs.append(name)
@@ -1571,9 +1575,30 @@ class AxiXbar(Xbar):
             merged.append(out)
         return merged
 
-    def emit_axi4_dummies(self):
-        """Describe the crossbar with the CIRCT AXI4 dialect's `dummies` ops."""
-        global code_axi4_mlir
+    @staticmethod
+    def axi4_window(lo, last):
+        return "<base = {:#x}, last = {:#x}, burst_specs = <<incr, len = 256>>>".format(lo, last)
+
+    def axi4_port_attrs(self, iw):
+        """Attributes of an external port with an `iw`-bit ID."""
+        # The lowering sizes each port's ID as `clog2(outstanding)`. Every port may carry
+        # atomics, as through `axi_xbar`; the PULP lowering sets `ATOPs` from these markers.
+        return ("addr_width = {}, data_width = {}, outstanding_writes = {n}, "
+                "outstanding_reads = {n}{}").format(
+                    self.aw, self.dw, " {pulp.atops}" if self.atop_support else "", n=1 << iw)
+
+    def axi4_xbar_op(self, result, mgrs):
+        pulp_cfg = [
+            "PULP_CONFIG_LatencyMode = \"{}\"".format(self.latency_mode),
+            "PULP_CONFIG_MaxSlvTrans = {} : i32".format(self.max_slv_trans),
+            "PULP_CONFIG_MaxMstTrans = {} : i32".format(self.max_mst_trans),
+            "PULP_CONFIG_FallThrough = {}".format(str(bool(self.fall_through)).lower()),
+        ]
+        return "  {} = axi4.dummies.xbar %clk, %rst_ni mgrs {} addr_width = {}, " \
+            "data_width = {} {{{}}}\n".format(result, ", ".join(mgrs), self.aw, self.dw,
+                                              ", ".join(pulp_cfg))
+
+    def axi4_check(self):
         unsupported = []
         # Constant maps stand in for a symbolic one.
         if (self.symbolic_addrmap or self.symbolic_addrmap_multi) and \
@@ -1587,25 +1612,12 @@ class AxiXbar(Xbar):
         # PULP cannot express a 0-bit ID.
         assert self.iw >= 1
 
-        bursts = "<<incr, len = 256>>"
-
-        def window(lo, last):
-            return "<base = {:#x}, last = {:#x}, burst_specs = {}>".format(lo, last, bursts)
-
-        # The lowering sizes each port's ID as `clog2(outstanding)`. Every port may carry
-        # atomics, as through `axi_xbar`; the PULP lowering sets `ATOPs` from these markers.
-        def widths(iw):
-            return ("addr_width = {}, data_width = {}, outstanding_writes = {n}, "
-                    "outstanding_reads = {n}{}").format(
-                        self.aw, self.dw, " {pulp.atops}" if self.atop_support else "",
-                        n=1 << iw)
-
-        pulp_cfg = [
-            "PULP_CONFIG_LatencyMode = \"{}\"".format(self.latency_mode),
-            "PULP_CONFIG_MaxSlvTrans = {} : i32".format(self.max_slv_trans),
-            "PULP_CONFIG_MaxMstTrans = {} : i32".format(self.max_mst_trans),
-            "PULP_CONFIG_FallThrough = {}".format(str(bool(self.fall_through)).lower()),
-        ]
+    def emit_axi4_dummies(self):
+        """Describe the crossbar with the CIRCT AXI4 dialect's `dummies` ops."""
+        global code_axi4_mlir
+        self.axi4_check()
+        window = self.axi4_window
+        widths = self.axi4_port_attrs
         req_in, resp_in = self.axi4_req_resp_bits(self.aw, self.dw, self.iw, self.uw)
         req_out, resp_out = self.axi4_req_resp_bits(self.aw, self.dw, self.iw_out(), self.uw)
         bits = dict()
@@ -1621,10 +1633,7 @@ class AxiXbar(Xbar):
             for i in self.inputs:
                 code += "  %in_{i}, %in_{i}_access = axi4.dummies.ext_manager \"in_{i}\" " \
                     "%clk, %rst_ni {}\n".format(widths(self.iw), i=i)
-            code += "  %xbar = axi4.dummies.xbar %clk, %rst_ni mgrs {} addr_width = {}, " \
-                "data_width = {} {{{}}}\n".format(
-                    ", ".join("%in_{}".format(i) for i in self.inputs), self.aw, self.dw,
-                    ", ".join(pulp_cfg))
+            code += self.axi4_xbar_op("%xbar", ["%in_{}".format(i) for i in self.inputs])
             windows = self.axi4_windows(addrmap)
             # Downstream ports are numbered in use-list order, which is reverse creation order;
             # keep solder's numbering.
@@ -1766,7 +1775,7 @@ class AxiXbar(Xbar):
                         idx, base, base, length, i=i))
         addrmap += "{}\n}};\n".format(',\n'.join(addrmap_lines))
 
-        if not self.axi4_dialect:
+        if not (self.axi4_dialect or self.axi4_network):
             code_module[self.context] += "\n" + addrmap
 
         # Emit the AXI structs into the package.
@@ -1838,6 +1847,8 @@ class AxiXbar(Xbar):
             )
             self.__dict__["out_" + name] = bus
 
+        if self.axi4_network:
+            return
         if self.axi4_dialect:
             self.emit_axi4_dummies()
             code_module[self.context] += "\n" + self.emit_axi4_instance(input_enums, output_enums)
@@ -1910,6 +1921,102 @@ class AxiXbar(Xbar):
         connectivity = "{}'b{}".format(length, connectivity[::-1])
 
         return connectivity
+
+
+# Crossbars generated as one CIRCT AXI4-dialect module, with the cuts on their ports.
+class Axi4Network(object):
+    def __init__(self, name, context, members):
+        self.name = name
+        self.context = context
+        self.members = members
+        # `(xbar, "in_<input>" | "out_<output>")` -> number of cuts on that port.
+        self.cuts = dict()
+
+    def add_cuts(self, xbar, port, n):
+        kind, name = port.split("_", 1)
+        assert name in {"in": xbar.inputs, "out": xbar.outputs}[kind]
+        self.cuts[(xbar, port)] = n
+
+    def select(self):
+        for x in self.members:
+            x.axi4_network = self
+        networks.append(self)
+
+    def module(self):
+        return "{}_axi4".format(self.name)
+
+    def apply_cuts(self, base, port, value):
+        """MLIR for the cuts on `port`, applied to `value`, and the resulting value."""
+        code = ""
+        for n in range(self.cuts.get(port, 0)):
+            result = "%{}_cut{}".format(base, n)
+            code += "  {} = axi4.dummies.cut %clk, %rst_ni, {}\n".format(result, value)
+            value = result
+        return code, value
+
+    def emit_mlir(self):
+        code = "hw.module @{}(in %clk : !seq.clock, in %rst_ni : i1) {{\n".format(self.module())
+        for x in self.members:
+            mgrs = []
+            for i in x.inputs:
+                n = "{}_in_{}".format(x.name, i)
+                code += "  %{n}, %{n}_access = axi4.dummies.ext_manager \"{n}\" %clk, %rst_ni " \
+                    "{}\n".format(x.axi4_port_attrs(x.iw), n=n)
+                cuts, value = self.apply_cuts(n, (x, "in_" + i), "%" + n)
+                code += cuts
+                mgrs.append(value)
+            code += x.axi4_xbar_op("%" + x.name, mgrs)
+            windows = x.axi4_windows(x.axi4_modules()[0][1])
+            # Downstream ports are numbered in use-list order, which is reverse creation order;
+            # keep solder's numbering.
+            for o, ws in reversed(list(zip(x.outputs, windows))):
+                n = "{}_out_{}".format(x.name, o)
+                cuts, value = self.apply_cuts(n, (x, "out_" + o), "%" + x.name)
+                code += cuts
+                code += "  %{n}_access = axi4.dummies.ext_subordinate \"{n}\" %clk, %rst_ni, " \
+                    "{}\n    windows <{}>\n    {}\n".format(
+                        value, ", ".join(x.axi4_window(*w) for w in ws),
+                        x.axi4_port_attrs(x.iw_out()), n=n)
+            for i in x.inputs:
+                for o, ws in zip(x.outputs, windows):
+                    if not x.connected(i, o):
+                        continue
+                    for w in ws:
+                        code += "  axi4.dummies.accesses %{}_in_{}_access -> %{}_out_{}_access " \
+                            "with {}\n".format(x.name, i, x.name, o, x.axi4_window(*w))
+        return code + "}\n"
+
+    def emit(self):
+        global code_axi4_mlir
+        code_module.setdefault(self.context, "")
+        x0 = self.members[0]
+        bits = dict()
+        ports = ["  .clk    ( {} )".format(x0.clk), "  .rst_ni ( {} )".format(x0.rst)]
+        code = ""
+        for x in self.members:
+            x.axi4_check()
+            assert x.axi4_variants is None
+            assert (x.clk, x.rst, x.uw, x.context) == (x0.clk, x0.rst, x0.uw, self.context)
+            req_in, resp_in = x.axi4_req_resp_bits(x.aw, x.dw, x.iw, x.uw)
+            req_out, resp_out = x.axi4_req_resp_bits(x.aw, x.dw, x.iw_out(), x.uw)
+            # The generated ports are anonymous structs, which pad or truncate silently.
+            pascal = util.pascalize(x.name)
+            code += "`ASSERT_INIT({}InBits, $bits({}_req_t) == {} && $bits({}_resp_t) == {})\n" \
+                .format(pascal, x.input_struct, req_in, x.input_struct, resp_in)
+            code += "`ASSERT_INIT({}OutBits, $bits({}_req_t) == {} && $bits({}_resp_t) == {})\n" \
+                .format(pascal, x.output_struct, req_out, x.output_struct, resp_out)
+            for kind, names, req, resp in (("in", x.inputs, req_in, resp_in),
+                                           ("out", x.outputs, req_out, resp_out)):
+                for p in names:
+                    bus = x.__dict__["{}_{}".format(kind, p)]
+                    n = "{}_{}_{}".format(x.name, kind, p)
+                    bits[n + "_req"], bits[n + "_resp"] = req, resp
+                    ports.append("  .{}_req ( {} )".format(n, bus.req_name()))
+                    ports.append("  .{}_resp ( {} )".format(n, bus.rsp_name()))
+        code += "{} i_{} (\n{}\n);\n".format(self.module(), self.name, ",\n".join(ports))
+        code_module[self.context] += "\n" + code
+        code_axi4_mlir += "\n" + self.emit_mlir()
+        axi4_ports[self.module()] = {"bits": bits, "user_width": x0.uw}
 
 
 # An AXI Demultiplexer.
@@ -2432,6 +2539,8 @@ def render():
 
     for xbar in xbars:
         xbar.emit()
+    for network in networks:
+        network.emit()
 
     # Clean things up.
     # code_module = code_module.strip()

@@ -212,6 +212,8 @@ MISC_OCCAMYGEN_SV_TARGETS += $(TARGET_SRC_DIR)/occamy_cluster_wrapper.sv
 # previously lowered SV file
 AXI4_XBARS    ?= quadrant_pre_xbar_*,quadrant_inter_xbar,soc_wide_xbar,soc_narrow_xbar,\
                  wide_xbar_quadrant_s1,narrow_xbar_quadrant_s1,quadrant_s1_ctrl_*_xbar
+# Networks of crossbars generated as one AXI4-dialect module each, with the cuts between them
+AXI4_NETWORKS ?= soc_narrow
 AXI4_XBARS_SV ?=
 CIRCT_OPT     ?= circt-opt
 AXI4_LOWER    ?= $(ROOT)/util/occamygen/axi4_lower.py
@@ -237,7 +239,7 @@ clean-soc:
 
 # Regenerate when the selection changes.
 .axi4_xbars: FORCE
-	@echo '$(AXI4_XBARS)' | cmp -s - $@ || echo '$(AXI4_XBARS)' > $@
+	@echo '$(AXI4_XBARS) $(AXI4_NETWORKS)' | cmp -s - $@ || echo '$(AXI4_XBARS) $(AXI4_NETWORKS)' > $@
 
 $(AXI4_SV): $(AXI4_MLIR) $(AXI4_LOWER) $(AXI4_XBARS_SV)
 	@echo "[CIRCT] Generate $@"
@@ -272,6 +274,7 @@ $(MISC_OCCAMYGEN_TARGETS): .misc_occamygen_targets_group
 		--xilinx-sv        $(SOURCE_OCCAMY_DIR)/occamy_xilinx.sv.tpl \
 		--cva6-sv          $(SOURCE_OCCAMY_DIR)/occamy_cva6.sv.tpl \
 		--axi4-xbars       '$(AXI4_XBARS)' \
+		--axi4-networks    '$(AXI4_NETWORKS)' \
 		--axi4-mlir        $(AXI4_MLIR)
 	@$(VERIBLE_FMT) --inplace $(MISC_OCCAMYGEN_SV_TARGETS)
 	@touch $@

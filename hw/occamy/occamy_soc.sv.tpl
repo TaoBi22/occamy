@@ -28,6 +28,8 @@
   cuts_hbmx_to_hbm = cfg["cuts"]["hbmx_to_hbm"]
   cuts_periph_axi_lite_narrow = cfg["cuts"]["periph_axi_lite_narrow"]
   cuts_periph_axi_lite = cfg["cuts"]["periph_axi_lite"]
+  #// The `soc_narrow` AXI4-dialect network generates the cuts next to `soc_narrow_xbar`.
+  net_narrow = "soc_narrow" in axi4_networks
   txns_wide_and_inter = cfg["txns"]["wide_and_inter"]
   txns_wide_to_hbm = cfg["txns"]["wide_to_hbm"]
   txns_narrow_and_wide = cfg["txns"]["narrow_and_wide"]
@@ -163,7 +165,7 @@ module ${name}_soc
       .change_iw(context, soc_narrow_xbar.in_soc_wide.iw, "soc_wide_narrow_iwc", max_txns_per_id=txns_narrow_and_wide) \
       .change_uw(context, soc_narrow_xbar.in_soc_wide.uw, "soc_wide_narrow_uwc") \
       .change_dw(context, soc_narrow_xbar.in_soc_wide.dw, "soc_wide_narrow_dw") \
-      .cut(context, cuts_narrow_and_wide, to=soc_narrow_xbar.in_soc_wide)
+      .cut(context, 0 if net_narrow else cuts_narrow_and_wide, to=soc_narrow_xbar.in_soc_wide)
   %>\
 
   //////////
@@ -174,7 +176,7 @@ module ${name}_soc
       .atomic_adapter(context, filter=True, max_trans=max_trans_atop_filter_ser, name="pcie_out_noatop", inst_name="i_pcie_out_atop_filter") \
       .cut(context, cuts_narrow_and_pcie, name="pcie_out", inst_name="i_pcie_out_cut")
     pcie_in = soc_narrow_xbar.__dict__["in_pcie"].copy(name="pcie_in").declare(context)
-    pcie_in.cut(context, cuts_narrow_and_pcie, to=soc_narrow_xbar.__dict__["in_pcie"])
+    pcie_in.cut(context, 0 if net_narrow else cuts_narrow_and_pcie, to=soc_narrow_xbar.__dict__["in_pcie"])
   %>\
 
   assign pcie_axi_req_o = ${pcie_out.req_name()};
@@ -187,7 +189,7 @@ module ${name}_soc
   //////////
   <%
     cva6_mst = soc_narrow_xbar.__dict__["in_cva6"].copy(name="cva6_mst").declare(context)
-    cva6_mst.cut(context, cuts_narrow_to_cva6, to=soc_narrow_xbar.__dict__["in_cva6"])
+    cva6_mst.cut(context, 0 if net_narrow else cuts_narrow_to_cva6, to=soc_narrow_xbar.__dict__["in_cva6"])
   %>\
 
   ${name}_cva6 i_${name}_cva6 (
@@ -211,9 +213,9 @@ module ${name}_soc
     nr_cores_s1_quadrant = nr_s1_clusters * nr_cluster_cores
     lower_core = i * nr_cores_s1_quadrant + 1
     #// narrow xbar -> quad & quad -> narrow xbar
-    narrow_in = soc_narrow_xbar.__dict__["out_s1_quadrant_{}".format(i)].cut(context, cuts_narrow_to_quad, name="narrow_in_{}".format(i))
+    narrow_in = soc_narrow_xbar.__dict__["out_s1_quadrant_{}".format(i)].cut(context, 0 if net_narrow else cuts_narrow_to_quad, name="narrow_in_{}".format(i))
     narrow_out = soc_narrow_xbar.__dict__["in_s1_quadrant_{}".format(i)].copy(name="narrow_out_{}".format(i)).declare(context)
-    narrow_out.cut(context, cuts_quad_to_narrow, name="narrow_out_cut_{}".format(i), to=soc_narrow_xbar.__dict__["in_s1_quadrant_{}".format(i)])
+    narrow_out.cut(context, 0 if net_narrow else cuts_quad_to_narrow, name="narrow_out_cut_{}".format(i), to=soc_narrow_xbar.__dict__["in_s1_quadrant_{}".format(i)])
     #// inter xbar -> quad & quad -> pre xbar
     wide_in = quadrant_inter_xbar.__dict__["out_quadrant_{}".format(i)].cut(context, cuts_inter_to_quad, name="wide_in_{}".format(i))
     wide_out = quadrant_pre_xbars[i].in_quadrant.copy(name="wide_out_{}".format(i)).declare(context)
@@ -253,7 +255,7 @@ module ${name}_soc
   // SPM NARROW //
   ////////////////
   <% narrow_spm_mst = soc_narrow_xbar.out_spm_narrow \
-                      .cut(context, cuts_narrow_conv_to_spm_narrow_pre) \
+                      .cut(context, 0 if net_narrow else cuts_narrow_conv_to_spm_narrow_pre) \
                       .atomic_adapter(context, max_trans=max_atomics_narrow, user_as_id=1, user_id_msb=soc_narrow_xbar.out_spm_narrow.uw-1, user_id_lsb=0, n_cuts= cuts_withing_atomic_adapter_narrow,name="spm_narrow_amo_adapter") \
                       .cut(context, cuts_narrow_conv_to_spm_narrow)
   %>\
@@ -638,7 +640,7 @@ module ${name}_soc
       .cut(context, cuts_wide_and_hbi, name="wide_to_hbi_cut")
     #// hbi <-> narrow xbar
     hbi_in_narrow_soc = soc_narrow_xbar.in_hbi.copy(name="hbi_in_narrow_soc").declare(context)
-    hbi_in_narrow_soc.cut(context, cuts_narrow_and_hbi, name="hbi_to_narrow_cut", to=soc_narrow_xbar.in_hbi)
+    hbi_in_narrow_soc.cut(context, 0 if net_narrow else cuts_narrow_and_hbi, name="hbi_to_narrow_cut", to=soc_narrow_xbar.in_hbi)
     hbi_out_narrow_soc = soc_narrow_xbar.out_hbi \
       .trunc_addr(context, hbi_trunc_addr_width, name="narrow_to_hbi_trunc") \
       .cut(context, cuts_narrow_and_hbi, name="narrow_to_hbi_cut")
@@ -688,7 +690,7 @@ module ${name}_soc
       .cut(context, cuts_periph_axi_lite, name="periph_axi_lite_out", inst_name="i_periph_axi_lite_out_cut") \
 
     periph_axi_lite_in = soc_narrow_xbar.__dict__["in_periph"].copy(name="periph_axi_lite_in").declare(context)
-    periph_axi_lite_in.cut(context, cuts_periph_axi_lite, to=soc_narrow_xbar.__dict__["in_periph"])
+    periph_axi_lite_in.cut(context, 0 if net_narrow else cuts_periph_axi_lite, to=soc_narrow_xbar.__dict__["in_periph"])
   %>\
 
   // Inputs

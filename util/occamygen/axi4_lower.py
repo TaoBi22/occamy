@@ -73,6 +73,8 @@ def check_ports(hw_mlir, expected):
                 errors.append("{}.{}: {} bits, but the connected struct has {}".format(
                     module, port, actual.get(port), bits))
         # The wrapper numbers ports as solder does, so the RTL can be compared index by index.
+        if "inputs" not in exp:
+            continue
         for kind, got in (("inputs", port_order(body, "in_", "req", "mgr", "awvalid", 1)),
                           ("outputs", port_order(body, "out_", "resp", "sub", "awready", 0))):
             if got != exp[kind]:
