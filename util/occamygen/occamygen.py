@@ -28,7 +28,7 @@ re_trailws = re.compile(r'[ \t\r]+$', re.MULTILINE)
 # Default name for all generated sources
 DEFAULT_NAME = "occamy"
 # Networks `--axi4-networks` can select.
-AXI4_NETWORKS = ["soc_narrow"]
+AXI4_NETWORKS = ["soc_narrow", "soc_wide"]
 
 
 def write_template(tpl_path, outdir, fname=None, **kwargs):
@@ -890,28 +890,63 @@ def main():
         rmq_demux[i].add_output("narrow")
         rmq_demux[i].add_output("wide")
 
-    # Networks of crossbars generated as one AXI4-dialect module each, with the cuts on their
-    # boundary ports that sit next to a crossbar in the templates.
+    # Networks of crossbars generated as one AXI4-dialect module each, with the cuts and ID
+    # remappers that sit next to a crossbar in the templates.
     cuts = occamy.cfg["cuts"]
-    soc_narrow = solder.Axi4Network("soc_narrow", "soc", [soc_narrow_xbar])
+    txns = occamy.cfg["txns"]
+    Net = solder.Axi4Network
+
+    soc_narrow = Net("soc_narrow", "soc", [soc_narrow_xbar])
     for i in range(nr_s1_quadrants):
-        soc_narrow.add_cuts(soc_narrow_xbar, "out_s1_quadrant_{}".format(i), cuts["narrow_to_quad"])
-        soc_narrow.add_cuts(soc_narrow_xbar, "in_s1_quadrant_{}".format(i), cuts["quad_to_narrow"])
-    soc_narrow.add_cuts(soc_narrow_xbar, "in_cva6", cuts["narrow_to_cva6"])
-    soc_narrow.add_cuts(soc_narrow_xbar, "in_soc_wide", cuts["narrow_and_wide"])
-    soc_narrow.add_cuts(soc_narrow_xbar, "in_periph", cuts["periph_axi_lite"])
-    soc_narrow.add_cuts(soc_narrow_xbar, "in_pcie", cuts["narrow_and_pcie"])
-    soc_narrow.add_cuts(soc_narrow_xbar, "in_hbi", cuts["narrow_and_hbi"])
-    soc_narrow.add_cuts(soc_narrow_xbar, "out_spm_narrow", cuts["narrow_conv_to_spm_narrow_pre"])
-    networks = {"soc_narrow": soc_narrow}
+        soc_narrow.add_chain(soc_narrow_xbar, "out_s1_quadrant_{}".format(i),
+                             Net.cuts(cuts["narrow_to_quad"]))
+        soc_narrow.add_chain(soc_narrow_xbar, "in_s1_quadrant_{}".format(i),
+                             Net.cuts(cuts["quad_to_narrow"]))
+    soc_narrow.add_chain(soc_narrow_xbar, "in_cva6", Net.cuts(cuts["narrow_to_cva6"]))
+    soc_narrow.add_chain(soc_narrow_xbar, "in_soc_wide", Net.cuts(cuts["narrow_and_wide"]))
+    soc_narrow.add_chain(soc_narrow_xbar, "in_periph", Net.cuts(cuts["periph_axi_lite"]))
+    soc_narrow.add_chain(soc_narrow_xbar, "in_pcie", Net.cuts(cuts["narrow_and_pcie"]))
+    soc_narrow.add_chain(soc_narrow_xbar, "in_hbi", Net.cuts(cuts["narrow_and_hbi"]))
+    soc_narrow.add_chain(soc_narrow_xbar, "out_spm_narrow",
+                         Net.cuts(cuts["narrow_conv_to_spm_narrow_pre"]))
+
+    soc_wide = Net("soc_wide", "soc", quadrant_pre_xbars + [quadrant_inter_xbar, soc_wide_xbar])
+    for i, pre in enumerate(quadrant_pre_xbars):
+        soc_wide.add_chain(pre, "in_quadrant", Net.cuts(cuts["quad_to_pre"]))
+        soc_wide.add_link(pre, "quadrant_inter_xbar", quadrant_inter_xbar,
+                          "quadrant_{}".format(i), Net.cuts(cuts["pre_to_inter"]))
+        soc_wide.add_chain(pre, "out_hbm_xbar", Net.cuts(cuts["pre_to_hbmx"]))
+        soc_wide.add_chain(quadrant_inter_xbar, "out_quadrant_{}".format(i),
+                           Net.cuts(cuts["inter_to_quad"]))
+    soc_wide.add_link(
+        quadrant_inter_xbar, "wide_xbar", soc_wide_xbar, "quadrant_inter_xbar",
+        Net.change_iw(quadrant_inter_xbar.iw_out(), soc_wide_xbar.iw, txns["wide_and_inter"]) +
+        Net.cuts(cuts["wide_and_inter"]))
+    soc_wide.add_link(
+        soc_wide_xbar, "quadrant_inter_xbar", quadrant_inter_xbar, "wide_xbar",
+        Net.cuts(cuts["wide_and_inter"]) +
+        Net.change_iw(soc_wide_xbar.iw_out(), quadrant_inter_xbar.iw, txns["wide_and_inter"]))
+    soc_wide.add_chain(
+        soc_wide_xbar, "out_hbm_xbar",
+        Net.change_iw(soc_wide_xbar.iw_out(), hbm_xbar.iw, txns["wide_to_hbm"]) +
+        Net.cuts(cuts["wide_to_hbm"]))
+    soc_wide.add_chain(
+        soc_wide_xbar, "out_soc_narrow",
+        Net.change_iw(soc_wide_xbar.iw_out(), soc_narrow_xbar.iw, txns["narrow_and_wide"]))
+    soc_wide.add_chain(soc_wide_xbar, "in_hbi", Net.cuts(cuts["wide_and_hbi"]))
+    soc_wide.add_chain(soc_wide_xbar, "out_spm_wide", Net.cuts(cuts["wide_conv_to_spm_wide"]))
+    soc_wide.add_chain(soc_wide_xbar, "out_wide_zero_mem",
+                       Net.cuts(cuts["wide_to_wide_zero_mem"]))
+
+    networks = {"soc_narrow": soc_narrow, "soc_wide": soc_wide}
     assert set(networks) == set(AXI4_NETWORKS)
 
-    axi4_networks = set()
+    axi4_networks = dict()
     for name in filter(None, (n.strip() for n in args.axi4_networks.split(","))):
         if name not in networks:
             exit("No network `{}`.".format(name))
         networks[name].select()
-        axi4_networks.add(name)
+        axi4_networks[name] = networks[name]
 
     # Select the crossbars generated with the AXI4 dialect.
     for pattern in filter(None, args.axi4_xbars.split(",")):

@@ -30,6 +30,9 @@
   cuts_periph_axi_lite = cfg["cuts"]["periph_axi_lite"]
   #// The `soc_narrow` AXI4-dialect network generates the cuts next to `soc_narrow_xbar`.
   net_narrow = "soc_narrow" in axi4_networks
+  #// The `soc_wide` network generates the links between its crossbars, and the cuts and ID
+  #// remappers next to them.
+  net_wide = axi4_networks.get("soc_wide")
   txns_wide_and_inter = cfg["txns"]["wide_and_inter"]
   txns_wide_to_hbm = cfg["txns"]["wide_to_hbm"]
   txns_narrow_and_wide = cfg["txns"]["narrow_and_wide"]
@@ -144,16 +147,20 @@ module ${name}_soc
   ///////////////////////////////////
   <%
     #// inter xbar -> wide xbar & wide xbar -> inter xbar
-    quadrant_inter_xbar.out_wide_xbar \
-      .change_iw(context, soc_wide_xbar.iw, "inter_to_wide_iw_conv_{}".format(i), max_txns_per_id=txns_wide_and_inter) \
-      .cut(context, cuts_wide_and_inter, name="inter_to_wide_cut_{}".format(i), to=soc_wide_xbar.in_quadrant_inter_xbar)
-    soc_wide_xbar.out_quadrant_inter_xbar \
-      .cut(context, cuts_wide_and_inter, name="wide_to_inter_cut_{}".format(i)) \
-      .change_iw(context, quadrant_inter_xbar.iw, "wide_to_inter_iw_conv_{}".format(i), to=quadrant_inter_xbar.in_wide_xbar,  max_txns_per_id=txns_wide_and_inter)
+    if not net_wide:
+      quadrant_inter_xbar.out_wide_xbar \
+        .change_iw(context, soc_wide_xbar.iw, "inter_to_wide_iw_conv_{}".format(i), max_txns_per_id=txns_wide_and_inter) \
+        .cut(context, cuts_wide_and_inter, name="inter_to_wide_cut_{}".format(i), to=soc_wide_xbar.in_quadrant_inter_xbar)
+      soc_wide_xbar.out_quadrant_inter_xbar \
+        .cut(context, cuts_wide_and_inter, name="wide_to_inter_cut_{}".format(i)) \
+        .change_iw(context, quadrant_inter_xbar.iw, "wide_to_inter_iw_conv_{}".format(i), to=quadrant_inter_xbar.in_wide_xbar,  max_txns_per_id=txns_wide_and_inter)
     #// wide xbar -> hbm xbar
-    soc_wide_xbar.out_hbm_xbar \
-      .change_iw(context, hbm_xbar.iw, "wide_to_hbm_iw_conv_{}".format(i), max_txns_per_id=txns_wide_to_hbm) \
-      .cut(context, cuts_wide_to_hbm, name="wide_to_hbm_iw_cut_{}".format(i), to=hbm_xbar.in_wide_xbar)
+    if net_wide:
+      net_wide.port(soc_wide_xbar, "out_hbm_xbar").cut(context, 0, to=hbm_xbar.in_wide_xbar)
+    else:
+      soc_wide_xbar.out_hbm_xbar \
+        .change_iw(context, hbm_xbar.iw, "wide_to_hbm_iw_conv_{}".format(i), max_txns_per_id=txns_wide_to_hbm) \
+        .cut(context, cuts_wide_to_hbm, name="wide_to_hbm_iw_cut_{}".format(i), to=hbm_xbar.in_wide_xbar)
     #// narrow xbar -> wide xbar & wide xbar -> narrow xbar
     soc_narrow_xbar.out_soc_wide \
       .atomic_adapter(context, max_trans=max_atomics_wide, user_as_id=1, user_id_msb=soc_narrow_xbar.out_soc_wide.uw-1, user_id_lsb=0, n_cuts= cuts_withing_atomic_adapter_narrow_wide, name="soc_narrow_wide_amo_adapter") \
@@ -161,8 +168,9 @@ module ${name}_soc
       .change_iw(context, soc_wide_xbar.in_soc_narrow.iw, "soc_narrow_wide_iwc", max_txns_per_id=txns_narrow_and_wide) \
       .change_uw(context, soc_wide_xbar.in_soc_narrow.uw, "soc_narrow_wide_uwc") \
       .change_dw(context, soc_wide_xbar.in_soc_narrow.dw, "soc_narrow_wide_dw", to=soc_wide_xbar.in_soc_narrow)
-    soc_wide_xbar.out_soc_narrow \
-      .change_iw(context, soc_narrow_xbar.in_soc_wide.iw, "soc_wide_narrow_iwc", max_txns_per_id=txns_narrow_and_wide) \
+    wide_to_narrow = net_wide.port(soc_wide_xbar, "out_soc_narrow") if net_wide else \
+      soc_wide_xbar.out_soc_narrow.change_iw(context, soc_narrow_xbar.in_soc_wide.iw, "soc_wide_narrow_iwc", max_txns_per_id=txns_narrow_and_wide)
+    wide_to_narrow \
       .change_uw(context, soc_narrow_xbar.in_soc_wide.uw, "soc_wide_narrow_uwc") \
       .change_dw(context, soc_narrow_xbar.in_soc_wide.dw, "soc_wide_narrow_dw") \
       .cut(context, 0 if net_narrow else cuts_narrow_and_wide, to=soc_narrow_xbar.in_soc_wide)
@@ -217,15 +225,16 @@ module ${name}_soc
     narrow_out = soc_narrow_xbar.__dict__["in_s1_quadrant_{}".format(i)].copy(name="narrow_out_{}".format(i)).declare(context)
     narrow_out.cut(context, 0 if net_narrow else cuts_quad_to_narrow, name="narrow_out_cut_{}".format(i), to=soc_narrow_xbar.__dict__["in_s1_quadrant_{}".format(i)])
     #// inter xbar -> quad & quad -> pre xbar
-    wide_in = quadrant_inter_xbar.__dict__["out_quadrant_{}".format(i)].cut(context, cuts_inter_to_quad, name="wide_in_{}".format(i))
+    wide_in = quadrant_inter_xbar.__dict__["out_quadrant_{}".format(i)].cut(context, 0 if net_wide else cuts_inter_to_quad, name="wide_in_{}".format(i))
     wide_out = quadrant_pre_xbars[i].in_quadrant.copy(name="wide_out_{}".format(i)).declare(context)
-    wide_out.cut(context, cuts_quad_to_pre, name="wide_out_cut_{}".format(i), to=quadrant_pre_xbars[i].in_quadrant)
+    wide_out.cut(context, 0 if net_wide else cuts_quad_to_pre, name="wide_out_cut_{}".format(i), to=quadrant_pre_xbars[i].in_quadrant)
     #// pre xbar -> inter xbar
-    quadrant_pre_xbars[i].out_quadrant_inter_xbar \
-      .cut(context, cuts_pre_to_inter, name="pre_to_inter_cut_{}".format(i), to=quadrant_inter_xbar.__dict__["in_quadrant_{}".format(i)])
+    if not net_wide:
+      quadrant_pre_xbars[i].out_quadrant_inter_xbar \
+        .cut(context, cuts_pre_to_inter, name="pre_to_inter_cut_{}".format(i), to=quadrant_inter_xbar.__dict__["in_quadrant_{}".format(i)])
     #// pre xbar -> hbm xbar
     quadrant_pre_xbars[i].out_hbm_xbar \
-      .cut(context, cuts_pre_to_hbmx, name="pre_to_hbm_cut_{}".format(i), to=hbm_xbar.__dict__["in_quadrant_{}".format(i)])
+      .cut(context, 0 if net_wide else cuts_pre_to_hbmx, name="pre_to_hbm_cut_{}".format(i), to=hbm_xbar.__dict__["in_quadrant_{}".format(i)])
   %>\
 
   ${name}_quadrant_s1 #(
@@ -322,7 +331,7 @@ module ${name}_soc
   // SPM WIDE //
   //////////////
   <% wide_spm_mst = soc_wide_xbar.out_spm_wide \
-                    .cut(context, cuts_wide_conv_to_spm_wide)
+                    .cut(context, 0 if net_wide else cuts_wide_conv_to_spm_wide)
   %>\
 
   <% spm_wide_words = cfg["spm_wide"]["length"]//(soc_wide_xbar.out_spm_wide.dw//8) %>\
@@ -387,7 +396,7 @@ module ${name}_soc
   // WIDE ZERO MEMORY //
   //////////////////////
   <% wide_zero_mem_mst = soc_wide_xbar.out_wide_zero_mem \
-                         .cut(context, cuts_wide_to_wide_zero_mem)
+                         .cut(context, 0 if net_wide else cuts_wide_to_wide_zero_mem)
   %>\
 
   <% wide_zero_mem_words = cfg["wide_zero_mem"]["length"]//(soc_wide_xbar.out_wide_zero_mem.dw//8) %>\
@@ -633,7 +642,7 @@ module ${name}_soc
   <%
     #// hbi <-> wide xbar
     hbi_in_wide_soc = soc_wide_xbar.in_hbi.copy(name="hbi_in_wide_soc").declare(context)
-    hbi_in_wide_soc.cut(context, cuts_wide_and_hbi, name="hbi_to_wide_cut", to=soc_wide_xbar.in_hbi)
+    hbi_in_wide_soc.cut(context, 0 if net_wide else cuts_wide_and_hbi, name="hbi_to_wide_cut", to=soc_wide_xbar.in_hbi)
     hbi_out_wide_soc = soc_wide_xbar.out_hbi \
       .trunc_addr(context, hbi_trunc_addr_width, name="wide_to_hbi_trunc") \
       .atomic_adapter(context, filter=True, max_trans=max_trans_atop_filter_ser, name="wide_to_hbi_noatop", inst_name="i_wide_to_hbi_atop_filter") \

@@ -1923,19 +1923,49 @@ class AxiXbar(Xbar):
         return connectivity
 
 
-# Crossbars generated as one CIRCT AXI4-dialect module, with the cuts on their ports.
+def axi4_intersect(a, b):
+    """Intersection of two lists of inclusive address ranges."""
+    return sorted((max(lo, lo2), min(hi, hi2)) for lo, hi in a for lo2, hi2 in b
+                  if max(lo, lo2) <= min(hi, hi2))
+
+
+# Connected crossbars generated as one CIRCT AXI4-dialect module, with the cuts and ID remappers
+# between them and on their ports.
 class Axi4Network(object):
     def __init__(self, name, context, members):
         self.name = name
         self.context = context
         self.members = members
-        # `(xbar, "in_<input>" | "out_<output>")` -> number of cuts on that port.
-        self.cuts = dict()
+        # `(src, output, dst, input)` -> ops along the link, in signal order.
+        self.links = dict()
+        # `(xbar, "in_<input>" | "out_<output>")` -> ops on that port, in signal order.
+        self.chains = dict()
+        # Outputs whose external end has another ID width than the crossbar port.
+        self.buses = dict()
 
-    def add_cuts(self, xbar, port, n):
+    @staticmethod
+    def cuts(n):
+        return [("cut", )] * n
+
+    @staticmethod
+    def change_iw(iw, target_iw, max_txns_per_id):
+        """Ops for `AxiBus.change_iw` from `iw` to `target_iw` bits."""
+        if target_iw == iw:
+            return []
+        # Widening prepends to the ID, which has no AXI4-dialect op.
+        assert target_iw < iw, "widening IDs is not supported"
+        return [("id_remap", 1 << target_iw, max_txns_per_id)]
+
+    def add_link(self, src, output, dst, input, ops=()):
+        assert output in src.outputs and input in dst.inputs
+        self.links[(src, output, dst, input)] = list(ops)
+
+    def add_chain(self, xbar, port, ops):
         kind, name = port.split("_", 1)
         assert name in {"in": xbar.inputs, "out": xbar.outputs}[kind]
-        self.cuts[(xbar, port)] = n
+        # The external end of an input keeps the crossbar's ID width.
+        assert kind == "out" or all(op[0] == "cut" for op in ops)
+        self.chains[(xbar, port)] = list(ops)
 
     def select(self):
         for x in self.members:
@@ -1945,45 +1975,107 @@ class Axi4Network(object):
     def module(self):
         return "{}_axi4".format(self.name)
 
-    def apply_cuts(self, base, port, value):
-        """MLIR for the cuts on `port`, applied to `value`, and the resulting value."""
+    def port(self, xbar, port):
+        """The bus the RTL connects to port `port` of member `xbar`."""
+        return self.buses.get((xbar, port)) or xbar.__dict__[port]
+
+    def link_from(self, x, o):
+        """`(dst, input, ops)` of the link from output `o` of `x`, if any."""
+        for (src, so, dst, di), ops in self.links.items():
+            if (src, so) == (x, o):
+                return dst, di, ops
+        return None
+
+    def linked_inputs(self):
+        return {(dst, di) for _, _, dst, di in self.links}
+
+    @staticmethod
+    def apply(base, ops, value, iw):
+        """MLIR for `ops` applied to `value`, the resulting value, and its ID width."""
         code = ""
-        for n in range(self.cuts.get(port, 0)):
-            result = "%{}_cut{}".format(base, n)
-            code += "  {} = axi4.dummies.cut %clk, %rst_ni, {}\n".format(result, value)
+        for n, op in enumerate(ops):
+            result = "%{}_{}{}".format(base, op[0], n)
+            if op[0] == "cut":
+                code += "  {} = axi4.dummies.cut %clk, %rst_ni, {}\n".format(result, value)
+            else:
+                code += "  {} = axi4.dummies.id_remap %clk, %rst_ni, {} max_unique_ids = {} " \
+                    "{{PULP_CONFIG_AxiMaxTxnsPerId = {} : i32}}\n".format(result, value, *op[1:])
+                iw = (op[1] - 1).bit_length()
             value = result
-        return code, value
+        return code, value, iw
+
+    def routes(self):
+        """`((xbar, input), (xbar, output), ranges)` of the external outputs each external input
+        reaches."""
+        windows = {x: x.axi4_windows(x.axi4_modules()[0][1]) for x in self.members}
+        routes = []
+
+        def walk(mgr, x, i, ranges, seen):
+            for o, ws in zip(x.outputs, windows[x]):
+                rs = axi4_intersect(ranges, ws)
+                if not rs or not x.connected(i, o):
+                    continue
+                link = self.link_from(x, o)
+                if link is None:
+                    routes.append((mgr, (x, o), rs))
+                # Ranges routed back to a crossbar on the path loop in the handwritten RTL too,
+                # and get no access.
+                elif link[0] not in seen:
+                    walk(mgr, link[0], link[1], rs, seen | {link[0]})
+
+        linked = self.linked_inputs()
+        for x in self.members:
+            for i in x.inputs:
+                if (x, i) not in linked:
+                    walk((x, i), x, i, [(0, (1 << x.aw) - 1)], {x})
+        return routes
 
     def emit_mlir(self):
         code = "hw.module @{}(in %clk : !seq.clock, in %rst_ni : i1) {{\n".format(self.module())
+        mgrs = dict()
+        linked = self.linked_inputs()
         for x in self.members:
-            mgrs = []
             for i in x.inputs:
+                if (x, i) in linked:
+                    continue
                 n = "{}_in_{}".format(x.name, i)
                 code += "  %{n}, %{n}_access = axi4.dummies.ext_manager \"{n}\" %clk, %rst_ni " \
                     "{}\n".format(x.axi4_port_attrs(x.iw), n=n)
-                cuts, value = self.apply_cuts(n, (x, "in_" + i), "%" + n)
-                code += cuts
-                mgrs.append(value)
-            code += x.axi4_xbar_op("%" + x.name, mgrs)
+                ops_code, mgrs[(x, i)], _ = self.apply(n, self.chains.get((x, "in_" + i), []),
+                                                       "%" + n, x.iw)
+                code += ops_code
+        for x in self.members:
+            # Links are named after their source; their crossbars may come later.
+            for o in x.outputs:
+                link = self.link_from(x, o)
+                if link:
+                    n = "{}_out_{}".format(x.name, o)
+                    mgrs[(link[0], link[1])] = self.apply(n, link[2], "%" + x.name, 0)[1]
+        for x in self.members:
+            code += x.axi4_xbar_op("%" + x.name, [mgrs[(x, i)] for i in x.inputs])
             windows = x.axi4_windows(x.axi4_modules()[0][1])
             # Downstream ports are numbered in use-list order, which is reverse creation order;
             # keep solder's numbering.
             for o, ws in reversed(list(zip(x.outputs, windows))):
                 n = "{}_out_{}".format(x.name, o)
-                cuts, value = self.apply_cuts(n, (x, "out_" + o), "%" + x.name)
-                code += cuts
+                link = self.link_from(x, o)
+                if link:
+                    ops_code, _, iw = self.apply(n, link[2], "%" + x.name, x.iw_out())
+                    assert iw == link[0].iw, "{}: `{}.{}` reaches `{}.{}` with a {}-bit ID" \
+                        .format(self.name, x.name, o, link[0].name, link[1], iw)
+                    code += ops_code
+                    continue
+                ops_code, value, iw = self.apply(n, self.chains.get((x, "out_" + o), []),
+                                                 "%" + x.name, x.iw_out())
+                code += ops_code
                 code += "  %{n}_access = axi4.dummies.ext_subordinate \"{n}\" %clk, %rst_ni, " \
                     "{}\n    windows <{}>\n    {}\n".format(
-                        value, ", ".join(x.axi4_window(*w) for w in ws),
-                        x.axi4_port_attrs(x.iw_out()), n=n)
-            for i in x.inputs:
-                for o, ws in zip(x.outputs, windows):
-                    if not x.connected(i, o):
-                        continue
-                    for w in ws:
-                        code += "  axi4.dummies.accesses %{}_in_{}_access -> %{}_out_{}_access " \
-                            "with {}\n".format(x.name, i, x.name, o, x.axi4_window(*w))
+                        value, ", ".join(x.axi4_window(*w) for w in ws), x.axi4_port_attrs(iw),
+                        n=n)
+        for (x, i), (y, o), rs in self.routes():
+            for r in rs:
+                code += "  axi4.dummies.accesses %{}_in_{}_access -> %{}_out_{}_access " \
+                    "with {}\n".format(x.name, i, y.name, o, x.axi4_window(*r))
         return code + "}\n"
 
     def emit(self):
@@ -1992,27 +2084,36 @@ class Axi4Network(object):
         x0 = self.members[0]
         bits = dict()
         ports = ["  .clk    ( {} )".format(x0.clk), "  .rst_ni ( {} )".format(x0.rst)]
-        code = ""
+        decls = ""
+        checks = dict()
+        linked = self.linked_inputs()
         for x in self.members:
             x.axi4_check()
             assert x.axi4_variants is None
             assert (x.clk, x.rst, x.uw, x.context) == (x0.clk, x0.rst, x0.uw, self.context)
-            req_in, resp_in = x.axi4_req_resp_bits(x.aw, x.dw, x.iw, x.uw)
-            req_out, resp_out = x.axi4_req_resp_bits(x.aw, x.dw, x.iw_out(), x.uw)
-            # The generated ports are anonymous structs, which pad or truncate silently.
-            pascal = util.pascalize(x.name)
-            code += "`ASSERT_INIT({}InBits, $bits({}_req_t) == {} && $bits({}_resp_t) == {})\n" \
-                .format(pascal, x.input_struct, req_in, x.input_struct, resp_in)
-            code += "`ASSERT_INIT({}OutBits, $bits({}_req_t) == {} && $bits({}_resp_t) == {})\n" \
-                .format(pascal, x.output_struct, req_out, x.output_struct, resp_out)
-            for kind, names, req, resp in (("in", x.inputs, req_in, resp_in),
-                                           ("out", x.outputs, req_out, resp_out)):
-                for p in names:
-                    bus = x.__dict__["{}_{}".format(kind, p)]
-                    n = "{}_{}_{}".format(x.name, kind, p)
-                    bits[n + "_req"], bits[n + "_resp"] = req, resp
-                    ports.append("  .{}_req ( {} )".format(n, bus.req_name()))
-                    ports.append("  .{}_resp ( {} )".format(n, bus.rsp_name()))
+            boundary = [("in", i) for i in x.inputs if (x, i) not in linked]
+            boundary += [("out", o) for o in x.outputs if not self.link_from(x, o)]
+            for kind, p in boundary:
+                bus = x.__dict__["{}_{}".format(kind, p)]
+                n = "{}_{}_{}".format(x.name, kind, p)
+                iw = self.apply("", self.chains.get((x, "{}_{}".format(kind, p)), []), "",
+                                bus.iw)[2]
+                if iw != bus.iw:
+                    bus = AxiBus(bus.clk, bus.rst, bus.aw, bus.dw, iw, bus.uw, n, declared=True)
+                    decls += "{} {};\n{} {};\n".format(bus.req_type(), bus.req_name(),
+                                                       bus.rsp_type(), bus.rsp_name())
+                    self.buses[(x, "{}_{}".format(kind, p))] = bus
+                req, resp = x.axi4_req_resp_bits(bus.aw, bus.dw, iw, bus.uw)
+                checks[bus.type_prefix] = (req, resp)
+                bits[n + "_req"], bits[n + "_resp"] = req, resp
+                ports.append("  .{}_req ( {} )".format(n, bus.req_name()))
+                ports.append("  .{}_resp ( {} )".format(n, bus.rsp_name()))
+
+        # The generated ports are anonymous structs, which pad or truncate silently.
+        code = decls
+        for struct, (req, resp) in sorted(checks.items()):
+            code += "`ASSERT_INIT({}Bits, $bits({s}_req_t) == {} && $bits({s}_resp_t) == {})\n" \
+                .format(util.pascalize("{}_{}".format(self.name, struct)), req, resp, s=struct)
         code += "{} i_{} (\n{}\n);\n".format(self.module(), self.name, ",\n".join(ports))
         code_module[self.context] += "\n" + code
         code_axi4_mlir += "\n" + self.emit_mlir()

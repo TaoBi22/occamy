@@ -212,8 +212,9 @@ MISC_OCCAMYGEN_SV_TARGETS += $(TARGET_SRC_DIR)/occamy_cluster_wrapper.sv
 # previously lowered SV file
 AXI4_XBARS    ?= quadrant_pre_xbar_*,quadrant_inter_xbar,soc_wide_xbar,soc_narrow_xbar,\
                  wide_xbar_quadrant_s1,narrow_xbar_quadrant_s1,quadrant_s1_ctrl_*_xbar
-# Networks of crossbars generated as one AXI4-dialect module each, with the cuts between them
-AXI4_NETWORKS ?= soc_narrow
+# Networks of crossbars generated as one AXI4-dialect module each, with the cuts and ID remappers
+# next to them
+AXI4_NETWORKS ?= soc_narrow,soc_wide
 AXI4_XBARS_SV ?=
 CIRCT_OPT     ?= circt-opt
 AXI4_LOWER    ?= $(ROOT)/util/occamygen/axi4_lower.py
