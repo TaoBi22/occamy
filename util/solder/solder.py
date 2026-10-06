@@ -1610,25 +1610,31 @@ class AxiXbar(Xbar):
     def axi4_window(lo, last):
         return "<base = {:#x}, last = {:#x}, burst_specs = <<incr, len = 256>>>".format(lo, last)
 
+    def axi4_per_id(self):
+        """Requests per ID each input admits; the lowering sets `MaxMstTrans` to this plus one."""
+        return self.max_mst_trans - 1
+
     def axi4_port_attrs(self, iw):
         """Attributes of an external port with an `iw`-bit ID."""
-        # The lowering sizes each port's ID as `clog2(outstanding)`. Every port may carry
+        # The lowering sizes each port's ID as `clog2(outstanding_*_ids)`. Occamy has no
+        # per-endpoint counts per ID, so endpoints match the crossbar. Every port may carry
         # atomics, as through `axi_xbar`; the PULP lowering sets `ATOPs` from these markers.
-        return ("addr_width = {}, data_width = {}, outstanding_writes = {n}, "
-                "outstanding_reads = {n}{}").format(
-                    self.aw, self.dw, " {pulp.atops}" if self.atop_support else "", n=1 << iw)
+        return ("addr_width = {}, data_width = {}, outstanding_write_ids = {n}, "
+                "outstanding_read_ids = {n}, concurrent_writes_per_id = {p}, "
+                "concurrent_reads_per_id = {p}{}").format(
+                    self.aw, self.dw, " {pulp.atops}" if self.atop_support else "", n=1 << iw,
+                    p=self.axi4_per_id())
 
     def axi4_xbar_op(self, result, mgrs, latency_mode=None):
         note = "  // {} (`{}`)\n".format(self.axi4_note, self.name) if self.axi4_note else ""
         pulp_cfg = [
             "PULP_CONFIG_LatencyMode = \"{}\"".format(latency_mode or self.latency_mode),
             "PULP_CONFIG_MaxSlvTrans = {} : i32".format(self.max_slv_trans),
-            "PULP_CONFIG_MaxMstTrans = {} : i32".format(self.max_mst_trans),
             "PULP_CONFIG_FallThrough = {}".format(str(bool(self.fall_through)).lower()),
         ]
         return note + "  {} = axi4.dummies.xbar %clk, %rst_ni mgrs {} addr_width = {}, " \
-            "data_width = {} {{{}}}\n".format(result, ", ".join(mgrs), self.aw, self.dw,
-                                              ", ".join(pulp_cfg))
+            "data_width = {}, upstream_concurrent_per_id = {} {{{}}}\n".format(
+                result, ", ".join(mgrs), self.aw, self.dw, self.axi4_per_id(), ", ".join(pulp_cfg))
 
     def axi4_check(self):
         unsupported = []
@@ -2067,8 +2073,8 @@ class Axi4Network(object):
             if op[0] == "cut":
                 code += "  {} = axi4.dummies.cut %clk, %rst_ni, {}\n".format(result, value)
             else:
-                code += "  {} = axi4.dummies.id_remap %clk, %rst_ni, {} max_unique_ids = {} " \
-                    "{{PULP_CONFIG_AxiMaxTxnsPerId = {} : i32}}\n".format(result, value, *op[1:])
+                code += "  {} = axi4.dummies.id_remap %clk, %rst_ni, {} max_unique_ids = {}, " \
+                    "concurrent_per_id = {}\n".format(result, value, *op[1:])
                 iw = (op[1] - 1).bit_length()
             value = result
         return code, value, iw
