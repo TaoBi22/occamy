@@ -214,7 +214,7 @@ AXI4_XBARS    ?= quadrant_pre_xbar_*,quadrant_inter_xbar,soc_wide_xbar,soc_narro
                  wide_xbar_quadrant_s1,narrow_xbar_quadrant_s1,quadrant_s1_ctrl_*_xbar
 # Networks of crossbars generated as one AXI4-dialect module each, with the cuts and ID remappers
 # next to them
-AXI4_NETWORKS ?= soc_narrow,soc_wide
+AXI4_NETWORKS ?= soc_narrow,soc_wide,quadrant
 AXI4_XBARS_SV ?=
 CIRCT_OPT     ?= circt-opt
 AXI4_LOWER    ?= $(ROOT)/util/occamygen/axi4_lower.py
@@ -247,12 +247,18 @@ $(AXI4_SV): $(AXI4_MLIR) $(AXI4_LOWER) $(AXI4_XBARS_SV)
 	@$(AXI4_LOWER) --mlir $< --out $@ --workdir $(TARGET_SRC_DIR)/axi4 --circt-opt $(CIRCT_OPT) \
 		$(if $(AXI4_XBARS_SV),--prebuilt $(AXI4_XBARS_SV))
 
+# The quadrant networks contain the cluster crossbars, which the cluster then leaves out.
+comma := ,
+CLUSTER_AXI4_IN_NETWORK = $(filter quadrant,$(subst $(comma), ,$(AXI4_NETWORKS)))
+
 # The first line records the inputs, so a previously generated file for other inputs is rejected.
-$(CLUSTER_AXI4_SV): $(CLUSTER_AXI4_INPUTS) $(CLUSTER_AXI4_XBARS_SV)
+$(CLUSTER_AXI4_SV): $(CLUSTER_AXI4_INPUTS) $(CLUSTER_AXI4_XBARS_SV) .axi4_xbars
 	@echo "[CIRCT] Generate $@"
 	@stamp="// axi4gen-inputs-sha256: $$(cat $(CLUSTER_AXI4_INPUTS) | \
 		python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"; \
-	if [ -n "$(CLUSTER_AXI4_XBARS_SV)" ]; then \
+	if [ -n "$(CLUSTER_AXI4_IN_NETWORK)" ]; then \
+		echo "// The quadrant AXI4 networks contain the cluster crossbars." > $@; \
+	elif [ -n "$(CLUSTER_AXI4_XBARS_SV)" ]; then \
 		head -n 1 $(CLUSTER_AXI4_XBARS_SV) | grep -qxF "$$stamp" || \
 			{ echo "$(CLUSTER_AXI4_XBARS_SV) was not generated from the current inputs."; exit 1; }; \
 		cp $(CLUSTER_AXI4_XBARS_SV) $@; \

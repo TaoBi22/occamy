@@ -1447,6 +1447,25 @@ class Xbar(object):
         xbars.append(self)
 
 
+def axi4_instance(name, module, variants, ports, clk, rst):
+    """Instantiate `module()`, or with `variants`, `module(k)` for the parameter's value `k`."""
+    if variants is None:
+        return "{} i_{} (\n{}\n);\n".format(module(), name, ports)
+
+    # One generated module per value of the parameter, each with that value's address maps.
+    param = variants["param"]
+    code = "`ASSERT({}{}, {} == {}, {}, !{})\n".format(
+        util.pascalize(name), param, variants["signal"], param, clk, rst)
+    code += "case ({})\n".format(param)
+    for k in range(len(variants["addrmaps"])):
+        code += "  {}: begin : gen_{}\n{} i_{} (\n{}\n);\n  end\n".format(
+            k, module(k)[:-len("_axi4")], module(k), name, ports)
+    code += "  default: begin : gen_{}_unsupported\n" \
+        "    initial $fatal(1, \"No generated {} for {} %0d\", {});\n  end\n" \
+        "endcase\n".format(name, name, param, param)
+    return code
+
+
 # An AXI crossbar.
 class AxiXbar(Xbar):
     configs = dict()
@@ -1674,22 +1693,8 @@ class AxiXbar(Xbar):
         for name, enum in zip(self.outputs, output_enums):
             ports.append("  .out_{n}_req ( {x}_out_req[{e}] )".format(n=name, x=self.name, e=enum))
             ports.append("  .out_{n}_resp ( {x}_out_rsp[{e}] )".format(n=name, x=self.name, e=enum))
-        ports = ",\n".join(ports)
-        if self.axi4_variants is None:
-            return code + "{} i_{} (\n{}\n);\n".format(self.axi4_module(), self.name, ports)
-
-        # One generated crossbar per value of the parameter, each with that value's address map.
-        param = self.axi4_variants["param"]
-        code += "`ASSERT({}{}, {} == {}, {}, !{})\n".format(
-            pascal, param, self.axi4_variants["signal"], param, self.clk, self.rst)
-        code += "case ({})\n".format(param)
-        for k in range(len(self.axi4_variants["addrmaps"])):
-            code += "  {}: begin : gen_{}\n{} i_{} (\n{}\n);\n  end\n".format(
-                k, self.axi4_module(k)[:-len("_axi4")], self.axi4_module(k), self.name, ports)
-        code += "  default: begin : gen_{}_unsupported\n" \
-            "    initial $fatal(1, \"No generated {} for {} %0d\", {});\n  end\n" \
-            "endcase\n".format(self.name, self.name, param, param)
-        return code
+        return code + axi4_instance(self.name, self.axi4_module, self.axi4_variants,
+                                    ",\n".join(ports), self.clk, self.rst)
 
     def emit(self):
         global code_module
@@ -1940,7 +1945,9 @@ class Axi4Network(object):
         self.links = dict()
         # `(xbar, "in_<input>" | "out_<output>")` -> ops on that port, in signal order.
         self.chains = dict()
-        # Outputs whose external end has another ID width than the crossbar port.
+        # `(xbar, input)` -> ID width of the external end, where ops on the input change it.
+        self.ext_iws = dict()
+        # Ports whose external end has another ID width than the crossbar port.
         self.buses = dict()
 
     @staticmethod
@@ -1960,20 +1967,42 @@ class Axi4Network(object):
         assert output in src.outputs and input in dst.inputs
         self.links[(src, output, dst, input)] = list(ops)
 
-    def add_chain(self, xbar, port, ops):
+    def add_chain(self, xbar, port, ops, iw=None):
+        """Ops on a port; `iw` is the ID width of the external end of an input."""
         kind, name = port.split("_", 1)
         assert name in {"in": xbar.inputs, "out": xbar.outputs}[kind]
-        # The external end of an input keeps the crossbar's ID width.
-        assert kind == "out" or all(op[0] == "cut" for op in ops)
+        assert iw is None or kind == "in"
         self.chains[(xbar, port)] = list(ops)
+        if iw is not None:
+            self.ext_iws[(xbar, name)] = iw
+
+    def ext_iw(self, x, kind, port):
+        """ID width of the external end of a port."""
+        if kind == "in":
+            return self.ext_iws.get((x, port), x.iw)
+        return self.apply("", self.chains.get((x, "out_" + port), []), "", x.iw_out())[2]
 
     def select(self):
         for x in self.members:
             x.axi4_network = self
         networks.append(self)
 
-    def module(self):
-        return "{}_axi4".format(self.name)
+    def variants(self):
+        """The members' common `axi4_variants`, if any."""
+        vs = [x.axi4_variants for x in self.members if x.axi4_variants]
+        for v in vs[1:]:
+            assert (v["param"], v["signal"], len(v["addrmaps"])) == \
+                (vs[0]["param"], vs[0]["signal"], len(vs[0]["addrmaps"]))
+        return vs[0] if vs else None
+
+    def module(self, variant=None):
+        if variant is None:
+            return "{}_axi4".format(self.name)
+        return "{}_{}{}_axi4".format(self.name, self.variants()["param"].lower(), variant)
+
+    @staticmethod
+    def addrmap(x, variant):
+        return x.axi4_modules()[0 if variant is None or x.axi4_variants is None else variant][1]
 
     def port(self, xbar, port):
         """The bus the RTL connects to port `port` of member `xbar`."""
@@ -2004,10 +2033,10 @@ class Axi4Network(object):
             value = result
         return code, value, iw
 
-    def routes(self):
+    def routes(self, variant):
         """`((xbar, input), (xbar, output), ranges)` of the external outputs each external input
         reaches."""
-        windows = {x: x.axi4_windows(x.axi4_modules()[0][1]) for x in self.members}
+        windows = {x: x.axi4_windows(self.addrmap(x, variant)) for x in self.members}
         routes = []
 
         def walk(mgr, x, i, ranges, seen):
@@ -2030,8 +2059,9 @@ class Axi4Network(object):
                     walk((x, i), x, i, [(0, (1 << x.aw) - 1)], {x})
         return routes
 
-    def emit_mlir(self):
-        code = "hw.module @{}(in %clk : !seq.clock, in %rst_ni : i1) {{\n".format(self.module())
+    def emit_mlir(self, variant):
+        code = "hw.module @{}(in %clk : !seq.clock, in %rst_ni : i1) {{\n".format(
+            self.module(variant))
         mgrs = dict()
         linked = self.linked_inputs()
         for x in self.members:
@@ -2039,10 +2069,13 @@ class Axi4Network(object):
                 if (x, i) in linked:
                     continue
                 n = "{}_in_{}".format(x.name, i)
+                iw = self.ext_iw(x, "in", i)
                 code += "  %{n}, %{n}_access = axi4.dummies.ext_manager \"{n}\" %clk, %rst_ni " \
-                    "{}\n".format(x.axi4_port_attrs(x.iw), n=n)
-                ops_code, mgrs[(x, i)], _ = self.apply(n, self.chains.get((x, "in_" + i), []),
-                                                       "%" + n, x.iw)
+                    "{}\n".format(x.axi4_port_attrs(iw), n=n)
+                ops_code, mgrs[(x, i)], iw = self.apply(n, self.chains.get((x, "in_" + i), []),
+                                                        "%" + n, iw)
+                assert iw == x.iw, "{}: `{}` reaches `{}` with a {}-bit ID".format(
+                    self.name, n, x.name, iw)
                 code += ops_code
         for x in self.members:
             # Links are named after their source; their crossbars may come later.
@@ -2053,7 +2086,7 @@ class Axi4Network(object):
                     mgrs[(link[0], link[1])] = self.apply(n, link[2], "%" + x.name, 0)[1]
         for x in self.members:
             code += x.axi4_xbar_op("%" + x.name, [mgrs[(x, i)] for i in x.inputs])
-            windows = x.axi4_windows(x.axi4_modules()[0][1])
+            windows = x.axi4_windows(self.addrmap(x, variant))
             # Downstream ports are numbered in use-list order, which is reverse creation order;
             # keep solder's numbering.
             for o, ws in reversed(list(zip(x.outputs, windows))):
@@ -2072,7 +2105,7 @@ class Axi4Network(object):
                     "{}\n    windows <{}>\n    {}\n".format(
                         value, ", ".join(x.axi4_window(*w) for w in ws), x.axi4_port_attrs(iw),
                         n=n)
-        for (x, i), (y, o), rs in self.routes():
+        for (x, i), (y, o), rs in self.routes(variant):
             for r in rs:
                 code += "  axi4.dummies.accesses %{}_in_{}_access -> %{}_out_{}_access " \
                     "with {}\n".format(x.name, i, y.name, o, x.axi4_window(*r))
@@ -2087,17 +2120,18 @@ class Axi4Network(object):
         decls = ""
         checks = dict()
         linked = self.linked_inputs()
+        # PULP structs carry at least one user bit, which `axi_xbar` passes through.
+        uw = max(x.uw for x in self.members)
         for x in self.members:
             x.axi4_check()
-            assert x.axi4_variants is None
-            assert (x.clk, x.rst, x.uw, x.context) == (x0.clk, x0.rst, x0.uw, self.context)
+            assert (x.clk, x.rst, max(x.uw, 1), x.context) == \
+                (x0.clk, x0.rst, max(uw, 1), self.context)
             boundary = [("in", i) for i in x.inputs if (x, i) not in linked]
             boundary += [("out", o) for o in x.outputs if not self.link_from(x, o)]
             for kind, p in boundary:
                 bus = x.__dict__["{}_{}".format(kind, p)]
                 n = "{}_{}_{}".format(x.name, kind, p)
-                iw = self.apply("", self.chains.get((x, "{}_{}".format(kind, p)), []), "",
-                                bus.iw)[2]
+                iw = self.ext_iw(x, kind, p)
                 if iw != bus.iw:
                     bus = AxiBus(bus.clk, bus.rst, bus.aw, bus.dw, iw, bus.uw, n, declared=True)
                     decls += "{} {};\n{} {};\n".format(bus.req_type(), bus.req_name(),
@@ -2114,10 +2148,12 @@ class Axi4Network(object):
         for struct, (req, resp) in sorted(checks.items()):
             code += "`ASSERT_INIT({}Bits, $bits({s}_req_t) == {} && $bits({s}_resp_t) == {})\n" \
                 .format(util.pascalize("{}_{}".format(self.name, struct)), req, resp, s=struct)
-        code += "{} i_{} (\n{}\n);\n".format(self.module(), self.name, ",\n".join(ports))
+        variants = self.variants()
+        code += axi4_instance(self.name, self.module, variants, ",\n".join(ports), x0.clk, x0.rst)
         code_module[self.context] += "\n" + code
-        code_axi4_mlir += "\n" + self.emit_mlir()
-        axi4_ports[self.module()] = {"bits": bits, "user_width": x0.uw}
+        for k in [None] if variants is None else range(len(variants["addrmaps"])):
+            code_axi4_mlir += "\n" + self.emit_mlir(k)
+            axi4_ports[self.module(k)] = {"bits": bits, "user_width": uw}
 
 
 # An AXI Demultiplexer.

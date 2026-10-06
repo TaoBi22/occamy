@@ -163,7 +163,7 @@ packages:
       Git: https://github.com/pulp-platform/scm.git
     dependencies: []
   snitch_cluster:
-    revision: 6a40b0c0d157a03a8add356277f33447e6a8ebd3
+    revision: 609850ed2663b0127712e8a70c625206cc1f5f17
     version: null
     source:
       Git: https://github.com/TaoBi22/snitch_cluster.git

@@ -21,14 +21,17 @@ from mako.template import Template
 
 sys.path.append(str(pathlib.Path(__file__).parent / '../'))
 from solder import solder, device_tree, util  # noqa: E402
+sys.path.append(str(pathlib.Path(__file__).parent / '../../deps/snitch_cluster/util/axi4gen'))
+import axi4gen  # noqa: E402
 
 # Compile a regex to trim trailing whitespaces on lines.
 re_trailws = re.compile(r'[ \t\r]+$', re.MULTILINE)
 
 # Default name for all generated sources
 DEFAULT_NAME = "occamy"
-# Networks `--axi4-networks` can select.
-AXI4_NETWORKS = ["soc_narrow", "soc_wide"]
+# Networks `--axi4-networks` can select; `quadrant` is the narrow and the wide network of each
+# quadrant, with the cluster crossbars.
+AXI4_NETWORKS = ["soc_narrow", "soc_wide", "quadrant"]
 
 
 def write_template(tpl_path, outdir, fname=None, **kwargs):
@@ -150,6 +153,14 @@ def main():
         # occamy.cfg["cluster"]["name"] = args.name
 
     occamy = Occamy(obj)
+
+    axi4_network_names = [n.strip() for n in args.axi4_networks.split(",") if n.strip()]
+    for name in axi4_network_names:
+        if name not in AXI4_NETWORKS:
+            exit("No network `{}`.".format(name))
+    # The quadrant networks contain the cluster crossbars, so the cluster exposes their ports.
+    if "quadrant" in axi4_network_names:
+        occamy.cluster.cfg["external_xbars"] = True
 
     # Arguments.
     nr_s1_quadrants = occamy.cfg["nr_s1_quadrant"]
@@ -938,15 +949,83 @@ def main():
     soc_wide.add_chain(soc_wide_xbar, "out_wide_zero_mem",
                        Net.cuts(cuts["wide_to_wide_zero_mem"]))
 
-    networks = {"soc_narrow": soc_narrow, "soc_wide": soc_wide}
-    assert set(networks) == set(AXI4_NETWORKS)
+    networks = {"soc_narrow": [soc_narrow], "soc_wide": [soc_wide]}
+
+    # The cluster crossbars, as `snitch_cluster.sv` instantiates them; only for the quadrant
+    # networks, since solder would otherwise instantiate them as `axi_xbar`s.
+    cluster_xbars = None
+    if "quadrant" in axi4_network_names:
+        cluster = occamy.cluster.cfg
+        assert not cluster["timing"].get("iso_crossings"), "clusters must share the quadrant clock"
+        cxb = axi4gen.ClusterXbars(cluster)
+        # Outputs in `snitch_pkg` order.
+        outputs = {"narrow": ["tcdm", "periph", "soc_out"], "wide": ["tcdm", "soc_out", "zero_mem"]}
+        cluster_xbars = []
+        for j in range(nr_s1_clusters):
+            cluster_xbars.append(dict())
+            for side, s in cxb.sides.items():
+                x = solder.AxiXbar(cxb.addr_width,
+                                   s["data_width"],
+                                   s["id_width_in"],
+                                   s["user_width"],
+                                   name="cluster_{}_{}_xbar".format(j, side),
+                                   clk="clk_quadrant",
+                                   rst="rst_quadrant_n",
+                                   max_slv_trans=s["trans"],
+                                   max_mst_trans=s["trans"],
+                                   atop_support=s["atops"],
+                                   latency_mode="axi_pkg::" + s["latency"],
+                                   context="quadrant_s1")
+                for m in s["mgrs"]:
+                    x.add_input(m)
+                for o in outputs[side]:
+                    x.add_output(o, [])
+                addrmaps = []
+                for t in range(nr_s1_quadrants):
+                    base = cluster_base_addr + (t * nr_s1_clusters + j) * cluster_base_offset
+                    windows, subs = axi4gen.with_soc_out(cxb.windows(base), cxb.sub_windows(side),
+                                                         cxb.addr_width)
+                    addrmaps.append([(x.outputs.index(sub), windows[w][0], windows[w][1] + 1)
+                                     for sub, ws in subs.items() for w in ws])
+                x.axi4_variants = {"param": "TileId", "signal": "tile_id_i", "addrmaps": addrmaps}
+                cluster_xbars[j][side] = x
+
+        # The cluster's own cuts on its external ports.
+        ext_cuts = {side: Net.cuts(int(cluster["timing"]["register_ext_" + side]))
+                    for side in ("narrow", "wide")}
+        quadrant_narrow = Net("quadrant_narrow", "quadrant_s1", [narrow_xbar_quadrant_s1] +
+                              [c["narrow"] for c in cluster_xbars])
+        quadrant_wide = Net("quadrant_wide", "quadrant_s1", [wide_xbar_quadrant_s1] +
+                            [c["wide"] for c in cluster_xbars])
+        quadrant_narrow.add_chain(
+            narrow_xbar_quadrant_s1, "in_top",
+            Net.change_iw(soc_narrow_xbar.iw_out(), narrow_xbar_quadrant_s1.iw, 4),
+            iw=soc_narrow_xbar.iw_out())
+        # One cut between the isolation and the ID remapper.
+        quadrant_wide.add_chain(
+            wide_xbar_quadrant_s1, "in_top",
+            Net.cuts(1) + Net.change_iw(quadrant_inter_xbar.iw_out(), wide_xbar_quadrant_s1.iw, 4),
+            iw=quadrant_inter_xbar.iw_out())
+        for j, c in enumerate(cluster_xbars):
+            quadrant_narrow.add_link(
+                narrow_xbar_quadrant_s1, "cluster_{}".format(j), c["narrow"], "soc_in",
+                Net.change_iw(narrow_xbar_quadrant_s1.iw_out(), c["narrow"].iw, 4) +
+                ext_cuts["narrow"])
+            quadrant_narrow.add_link(c["narrow"], "soc_out", narrow_xbar_quadrant_s1,
+                                     "cluster_{}".format(j), ext_cuts["narrow"])
+            quadrant_wide.add_link(
+                wide_xbar_quadrant_s1, "cluster_{}".format(j), c["wide"], "soc_in",
+                Net.change_iw(wide_xbar_quadrant_s1.iw_out(), c["wide"].iw,
+                              occamy.cfg["s1_quadrant"]["wide_trans"]) + ext_cuts["wide"])
+            quadrant_wide.add_link(c["wide"], "soc_out", wide_xbar_quadrant_s1,
+                                   "cluster_{}".format(j), ext_cuts["wide"])
+        networks["quadrant"] = [quadrant_narrow, quadrant_wide]
 
     axi4_networks = dict()
-    for name in filter(None, (n.strip() for n in args.axi4_networks.split(","))):
-        if name not in networks:
-            exit("No network `{}`.".format(name))
-        networks[name].select()
-        axi4_networks[name] = networks[name]
+    for name in axi4_network_names:
+        for net in networks[name]:
+            net.select()
+            axi4_networks[net.name] = net
 
     # Select the crossbars generated with the AXI4 dialect.
     for pattern in filter(None, args.axi4_xbars.split(",")):
@@ -1010,7 +1089,8 @@ def main():
         "nr_hbm_channels": nr_hbm_channels,
         "rmq_mux": rmq_mux,
         "rmq_demux": rmq_demux,
-        "axi4_networks": axi4_networks
+        "axi4_networks": axi4_networks,
+        "cluster_xbars": cluster_xbars
     }
 
     # Emit the code.

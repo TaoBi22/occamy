@@ -23,6 +23,11 @@
   narrow_tlb_entries = narrow_tlb_cfg.get("l1_num_entries", 1)
   wide_tlb_cfg = cfg["s1_quadrant"].get("wide_tlb_cfg", {})
   wide_tlb_entries = wide_tlb_cfg.get("l1_num_entries", 1)
+  #// The quadrant AXI4-dialect networks generate the crossbars, the cluster crossbars, the links
+  #// between them, and the cuts and ID remappers on the way in.
+  net_narrow = axi4_networks.get("quadrant_narrow")
+  net_wide = axi4_networks.get("quadrant_wide")
+  nr_hives = len(cfg["cluster"]["hives"])
 %>
 
 `include "axi/typedef.svh"
@@ -91,10 +96,14 @@ module ${name}_quadrant_s1
     narrow_cluster_in_ctrl = soc_narrow_xbar.out_s1_quadrant_0 \
       .copy(name="narrow_cluster_in_ctrl") \
       .declare(context)
-    narrow_cluster_in_ctrl \
+    narrow_cluster_in_isolate = narrow_cluster_in_ctrl \
       .cut(context, cuts_narrx_with_ctrl) \
-      .isolate(context, "isolate[0]", "narrow_cluster_in_isolate", isolated="isolated[0]", terminated=True, to_clk="clk_quadrant", to_rst="rst_quadrant_n", num_pending=narrow_trans) \
-      .change_iw(context, narrow_xbar_quadrant_s1.in_top.iw, "narrow_cluster_in_iwc", to=narrow_xbar_quadrant_s1.in_top)
+      .isolate(context, "isolate[0]", "narrow_cluster_in_isolate", isolated="isolated[0]", terminated=True, to_clk="clk_quadrant", to_rst="rst_quadrant_n", num_pending=narrow_trans)
+    if net_narrow:
+      narrow_cluster_in_isolate.cut(context, 0, to=net_narrow.port(narrow_xbar_quadrant_s1, "in_top"))
+    else:
+      narrow_cluster_in_isolate \
+        .change_iw(context, narrow_xbar_quadrant_s1.in_top.iw, "narrow_cluster_in_iwc", to=narrow_xbar_quadrant_s1.in_top)
   %>
 
   /////////////////////////////////////
@@ -168,13 +177,17 @@ module ${name}_quadrant_s1
   // Wide In + IW Converter //
   ////////////////////////////
   <%
-    quadrant_inter_xbar.out_quadrant_0 \
+    wide_cluster_in_isolate = quadrant_inter_xbar.out_quadrant_0 \
       .copy(name="wide_cluster_in_iwc") \
       .declare(context) \
       .cut(context, cuts_wideiwc_with_wideout) \
-      .isolate(context, "isolate[2]", "wide_cluster_in_isolate", isolated="isolated[2]", terminated=True, atop_support=False, to_clk="clk_quadrant", to_rst="rst_quadrant_n", num_pending=wide_trans) \
-      .cut(context, cuts_wideisolate_with_wideiwc_in) \
-      .change_iw(context, wide_xbar_quadrant_s1.in_top.iw, "wide_cluster_in_iwc", to=wide_xbar_quadrant_s1.in_top)
+      .isolate(context, "isolate[2]", "wide_cluster_in_isolate", isolated="isolated[2]", terminated=True, atop_support=False, to_clk="clk_quadrant", to_rst="rst_quadrant_n", num_pending=wide_trans)
+    if net_wide:
+      wide_cluster_in_isolate.cut(context, 0, to=net_wide.port(wide_xbar_quadrant_s1, "in_top"))
+    else:
+      wide_cluster_in_isolate \
+        .cut(context, cuts_wideisolate_with_wideiwc_in) \
+        .change_iw(context, wide_xbar_quadrant_s1.in_top.iw, "wide_cluster_in_iwc", to=wide_xbar_quadrant_s1.in_top)
   %>
   assign wide_cluster_in_iwc_req = quadrant_wide_in_req_i;
   assign quadrant_wide_in_rsp_o = wide_cluster_in_iwc_rsp;
@@ -222,6 +235,41 @@ module ${name}_quadrant_s1
   ///////////////
   // Cluster ${i} //
   ///////////////
+% if net_narrow:
+  <%
+    #// The crossbar ports, indexed as in `snitch_pkg`; `soc_in` and `soc_out` are links in the networks.
+    ports = [
+      (net_narrow, cluster_xbars[i]["narrow"], "narrow", [("core", "CoreReq"), ("ptw", "PTW")], ["AXISoC"],
+       [("tcdm", "TCDM"), ("periph", "ClusterPeripherals")], ["SoC"]),
+      (net_wide, cluster_xbars[i]["wide"], "wide", [("dma", "SDMAMst")] + [("icache_{}".format(h), "ICache + {}".format(h)) for h in range(nr_hives)], ["SoCDMAIn"],
+       [("tcdm", "TCDMDMA"), ("zero_mem", "ZeroMemory")], ["SoCDMAOut"]),
+    ]
+  %>\
+  ${name}_cluster_pkg::narrow_in_req_t [2:0] narrow_mgr_req_${i};
+  ${name}_cluster_pkg::narrow_in_resp_t [2:0] narrow_mgr_resp_${i};
+  ${name}_cluster_pkg::narrow_out_req_t [2:0] narrow_sub_req_${i};
+  ${name}_cluster_pkg::narrow_out_resp_t [2:0] narrow_sub_resp_${i};
+  ${name}_cluster_pkg::wide_in_req_t [${nr_hives + 1}:0] wide_mgr_req_${i};
+  ${name}_cluster_pkg::wide_in_resp_t [${nr_hives + 1}:0] wide_mgr_resp_${i};
+  ${name}_cluster_pkg::wide_out_req_t [2:0] wide_sub_req_${i};
+  ${name}_cluster_pkg::wide_out_resp_t [2:0] wide_sub_resp_${i};
+% for net, xbar, side, mgrs, unused_mgrs, subs, unused_subs in ports:
+% for port, idx in mgrs:
+  assign ${net.port(xbar, "in_" + port).req_name()} = ${side}_mgr_req_${i}[snitch_pkg::${idx}];
+  assign ${side}_mgr_resp_${i}[snitch_pkg::${idx}] = ${net.port(xbar, "in_" + port).rsp_name()};
+% endfor
+% for idx in unused_mgrs:
+  assign ${side}_mgr_resp_${i}[snitch_pkg::${idx}] = '0;
+% endfor
+% for port, idx in subs:
+  assign ${side}_sub_req_${i}[snitch_pkg::${idx}] = ${net.port(xbar, "out_" + port).req_name()};
+  assign ${net.port(xbar, "out_" + port).rsp_name()} = ${side}_sub_resp_${i}[snitch_pkg::${idx}];
+% endfor
+% for idx in unused_subs:
+  assign ${side}_sub_req_${i}[snitch_pkg::${idx}] = '0;
+% endfor
+% endfor
+% else:
   <%
     narrow_cluster_in = narrow_xbar_quadrant_s1.__dict__["out_cluster_{}".format(i)].change_iw(context, cfg["cluster"]["id_width_in"], "narrow_in_iwc_{}".format(i)).cut(context, cuts_narrx_with_cluster)
     narrow_cluster_out = narrow_xbar_quadrant_s1.__dict__["in_cluster_{}".format(i)].copy(name="narrow_out_{}".format(i)).declare(context)
@@ -230,6 +278,7 @@ module ${name}_quadrant_s1
     wide_cluster_out = wide_xbar_quadrant_s1.__dict__["in_cluster_{}".format(i)].copy(name="wide_out_{}".format(i)).declare(context)
     wide_cluster_out.cut(context, cuts_widex_with_cluster, to=wide_xbar_quadrant_s1.__dict__["in_cluster_{}".format(i)])
   %>
+% endif
 
   logic [9:0] hart_base_id_${i};
   assign hart_base_id_${i} = HartIdOffset + tile_id_i * NrCoresS1Quadrant + ${i} * NrCoresCluster;
@@ -244,6 +293,16 @@ module ${name}_quadrant_s1
     .msip_i (msip_i[${i}*NrCoresCluster+:NrCoresCluster]),
     .hart_base_id_i (hart_base_id_${i}),
     .cluster_base_addr_i (cluster_base_addr[${i}]),
+% if net_narrow:
+    .narrow_mgr_req_o (narrow_mgr_req_${i}),
+    .narrow_mgr_resp_i (narrow_mgr_resp_${i}),
+    .narrow_sub_req_i (narrow_sub_req_${i}),
+    .narrow_sub_resp_o (narrow_sub_resp_${i}),
+    .wide_mgr_req_o (wide_mgr_req_${i}),
+    .wide_mgr_resp_i (wide_mgr_resp_${i}),
+    .wide_sub_req_i (wide_sub_req_${i}),
+    .wide_sub_resp_o (wide_sub_resp_${i}),
+% else:
     .narrow_in_req_i (${narrow_cluster_in.req_name()}),
     .narrow_in_resp_o (${narrow_cluster_in.rsp_name()}),
     .narrow_out_req_o  (${narrow_cluster_out.req_name()}),
@@ -252,6 +311,7 @@ module ${name}_quadrant_s1
     .wide_out_resp_i (${wide_cluster_out.rsp_name()}),
     .wide_in_req_i (${wide_cluster_in.req_name()}),
     .wide_in_resp_o (${wide_cluster_in.rsp_name()}),
+% endif
     .sram_cfgs_i (sram_cfg_i.cluster)
   );
 
