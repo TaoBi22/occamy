@@ -51,15 +51,35 @@ def port_bits(body):
     return bits
 
 
+def instances(body):
+    """Module and input bindings of each instance in a module body, by instance name."""
+    insts = dict()
+    for m in re.finditer(r'hw\.instance "(\w+)" @(\w+)\((.*?)\) -> \(', body, re.S):
+        insts[m.group(1)] = (m.group(2), dict(re.findall(r"\b(\w+): (%[\w.]+)", m.group(3))))
+    return insts
+
+
 def port_order(body, prefix, struct, field, sig, pos):
-    """Names of the `<prefix>*_<struct>` ports, ordered as the wrapper's `<field>K` ports."""
+    """Names of the `<prefix>*_<struct>` ports, ordered as the crossbar's `<field>K` ports."""
     names = dict()
     for m in re.finditer(r"^\s*(%.*?) = hw\.struct_explode %{}(\w+)_{}\b".format(prefix, struct),
                          body, re.M):
         names[m.group(1).split(", ")[pos]] = m.group(2)
+    insts = instances(body)
+    xbar = next(b for mod, b in insts.values() if mod.startswith("axi_xbar"))
     order = dict()
-    for m in re.finditer(r"\b{}(\d+)_{}: (%\w+)".format(field, sig), body):
-        order[int(m.group(1))] = names.get(m.group(2))
+    for port, value in xbar.items():
+        m = re.fullmatch(r"{}(\d+)_{}".format(field, sig), port)
+        if not m:
+            continue
+        # Follow the signal back through cuts: a cut's `sub0_*` output is its `mgr0_*` input.
+        while True:
+            c = re.fullmatch(r"%(\w+)\.(mgr|sub)0_(\w+)", value)
+            if not c or not insts.get(c.group(1), ("",))[0].startswith("axi_cut"):
+                break
+            side = {"mgr": "sub", "sub": "mgr"}[c.group(2)]
+            value = insts[c.group(1)][1]["{}0_{}".format(side, c.group(3))]
+        order[int(m.group(1))] = names.get(value)
     return [order[k] for k in sorted(order)]
 
 

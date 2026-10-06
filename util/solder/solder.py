@@ -1625,16 +1625,31 @@ class AxiXbar(Xbar):
                     self.aw, self.dw, " {pulp.atops}" if self.atop_support else "", n=1 << iw,
                     p=self.axi4_per_id())
 
-    def axi4_xbar_op(self, result, mgrs, latency_mode=None):
+    # The latency modes whose registers are cuts on whole ports: (inputs, outputs).
+    PORT_CUTS = {
+        "axi_pkg::NO_LATENCY": (False, False),
+        "axi_pkg::CUT_SLV_PORTS": (True, False),
+        "axi_pkg::CUT_MST_PORTS": (False, True),
+        "axi_pkg::CUT_ALL_PORTS": (True, True),
+    }
+
+    def axi4_port_cuts(self):
+        """Cuts standing in for the crossbar's own registers: (per input, per output)."""
+        return tuple(int(c) for c in self.PORT_CUTS.get(self.latency_mode, (False, False)))
+
+    def axi4_xbar_op(self, result, mgrs):
         note = "  // {} (`{}`)\n".format(self.axi4_note, self.name) if self.axi4_note else ""
-        pulp_cfg = [
-            "PULP_CONFIG_LatencyMode = \"{}\"".format(latency_mode or self.latency_mode),
-            "PULP_CONFIG_MaxSlvTrans = {} : i32".format(self.max_slv_trans),
-            "PULP_CONFIG_FallThrough = {}".format(str(bool(self.fall_through)).lower()),
-        ]
+        pulp_cfg = []
+        # Other latency modes stay inside the crossbar.
+        if self.latency_mode not in self.PORT_CUTS:
+            pulp_cfg.append("PULP_CONFIG_LatencyMode = \"{}\"".format(self.latency_mode))
+        if self.fall_through:
+            pulp_cfg.append("PULP_CONFIG_FallThrough = true")
         return note + "  {} = axi4.dummies.xbar %clk, %rst_ni mgrs {} addr_width = {}, " \
-            "data_width = {}, upstream_concurrent_per_id = {} {{{}}}\n".format(
-                result, ", ".join(mgrs), self.aw, self.dw, self.axi4_per_id(), ", ".join(pulp_cfg))
+            "data_width = {}, upstream_concurrent_per_id = {}, downstream_pending_writes = {}" \
+            "{}\n".format(result, ", ".join(mgrs), self.aw, self.dw, self.axi4_per_id(),
+                          self.max_slv_trans,
+                          " {{{}}}".format(", ".join(pulp_cfg)) if pulp_cfg else "")
 
     def axi4_check(self):
         unsupported = []
@@ -1666,19 +1681,26 @@ class AxiXbar(Xbar):
             bits["out_{}_req".format(o)] = req_out
             bits["out_{}_resp".format(o)] = resp_out
 
+        in_cuts, out_cuts = (Axi4Network.cuts(n) for n in self.axi4_port_cuts())
         for mod, addrmap in self.axi4_modules():
             code = "hw.module @{}(in %clk : !seq.clock, in %rst_ni : i1) {{\n".format(mod)
+            mgrs = []
             for i in self.inputs:
                 code += "  %in_{i}, %in_{i}_access = axi4.dummies.ext_manager \"in_{i}\" " \
                     "%clk, %rst_ni {}\n".format(widths(self.iw), i=i)
-            code += self.axi4_xbar_op("%xbar", ["%in_{}".format(i) for i in self.inputs])
+                cut_code, mgr, _ = Axi4Network.apply("in_" + i, in_cuts, "%in_" + i, self.iw)
+                code += cut_code
+                mgrs.append(mgr)
+            code += self.axi4_xbar_op("%xbar", mgrs)
             windows = self.axi4_windows(addrmap)
             # Downstream ports are numbered in use-list order, which is reverse creation order;
             # keep solder's numbering.
             for o, ws in reversed(list(zip(self.outputs, windows))):
+                cut_code, sub, _ = Axi4Network.apply("out_" + o, out_cuts, "%xbar", self.iw_out())
+                code += cut_code
                 code += "  %out_{o}_access = axi4.dummies.ext_subordinate \"out_{o}\" " \
-                    "%clk, %rst_ni, %xbar\n    windows <{}>\n    {}\n".format(
-                        ", ".join(window(*w) for w in ws), widths(self.iw_out()), o=o)
+                    "%clk, %rst_ni, {}\n    windows <{}>\n    {}\n".format(
+                        sub, ", ".join(window(*w) for w in ws), widths(self.iw_out()), o=o)
             for i in self.inputs:
                 for o, ws in zip(self.outputs, windows):
                     if not self.connected(i, o):
@@ -2044,25 +2066,13 @@ class Axi4Network(object):
     def linked_inputs(self):
         return {(dst, di) for _, _, dst, di in self.links}
 
-    # The latency modes whose registers are cuts on whole ports: (inputs, outputs).
-    PORT_CUTS = {
-        "axi_pkg::NO_LATENCY": (False, False),
-        "axi_pkg::CUT_SLV_PORTS": (True, False),
-        "axi_pkg::CUT_MST_PORTS": (False, True),
-        "axi_pkg::CUT_ALL_PORTS": (True, True),
-    }
-
     def in_ops(self, x, ops):
         """`ops` into an input of `x`, followed by the crossbar's own register as a cut."""
-        return ops + self.cuts(int(self.PORT_CUTS.get(x.latency_mode, (0, 0))[0]))
+        return ops + self.cuts(x.axi4_port_cuts()[0])
 
     def out_ops(self, x, ops):
         """`ops` from an output of `x`, after the crossbar's own register as a cut."""
-        return self.cuts(int(self.PORT_CUTS.get(x.latency_mode, (0, 0))[1])) + ops
-
-    def latency_mode(self, x):
-        """`x`'s latency mode once its port registers are cuts; others stay inside it."""
-        return "axi_pkg::NO_LATENCY" if x.latency_mode in self.PORT_CUTS else None
+        return self.cuts(x.axi4_port_cuts()[1]) + ops
 
     @staticmethod
     def apply(base, ops, value, iw):
@@ -2133,8 +2143,7 @@ class Axi4Network(object):
                     mgrs[(link[0], link[1])] = self.apply(n, self.link_ops(x, link), "%" +
                                                           x.axi4_name(), 0)[1]
         for x in self.members:
-            code += x.axi4_xbar_op("%" + x.axi4_name(), [mgrs[(x, i)] for i in x.inputs],
-                                   self.latency_mode(x))
+            code += x.axi4_xbar_op("%" + x.axi4_name(), [mgrs[(x, i)] for i in x.inputs])
             windows = x.axi4_windows(self.addrmap(x, variant))
             # Downstream ports are numbered in use-list order, which is reverse creation order;
             # keep solder's numbering.
