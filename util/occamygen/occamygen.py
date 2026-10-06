@@ -782,6 +782,7 @@ def main():
         xbar = quadrant_s1_ctrl_xbars[name]
         xbar.axi4_variants = {
             "param": "TileId",
+            "suffix": "tile",
             "signal": "tile_id_i",
             "addrmaps": [[(xbar.outputs.index("internal"), cfg_base + t * cfg_size,
                            cfg_base + (t + 1) * cfg_size)] for t in range(nr_s1_quadrants)]
@@ -867,6 +868,7 @@ def main():
     for xbar in (wide_xbar_quadrant_s1, narrow_xbar_quadrant_s1):
         xbar.axi4_variants = {
             "param": "TileId",
+            "suffix": "tile",
             "signal": "tile_id_i",
             "addrmaps": [cluster_addrmap(xbar, t) for t in range(nr_s1_quadrants)]
         }
@@ -901,13 +903,32 @@ def main():
         rmq_demux[i].add_output("narrow")
         rmq_demux[i].add_output("wide")
 
+    # Names in the AXI4-dialect descriptions, after Fig. 1 of the Occamy paper: (a) compute
+    # cluster, (c) compute group (a quadrant), (d) chiplet.
+    for xbar, label, note in [
+        (soc_narrow_xbar, "chiplet_64b_xbar", 'Fig. 1(d) chiplet: "64b xbar"'),
+        (soc_wide_xbar, "chiplet_system_xbar", 'Fig. 1(d) chiplet: "System xbar"'),
+        (quadrant_inter_xbar, "chiplet_group_xbar", 'Fig. 1(d) chiplet: "Group xbar"'),
+        (hbm_xbar, "chiplet_hbm_xbar", 'Fig. 1(d) chiplet: "HBM xbar"'),
+        (narrow_xbar_quadrant_s1, "group_64b_xbar", 'Fig. 1(c) compute group: "64b xbar"'),
+        (wide_xbar_quadrant_s1, "group_512b_xbar", 'Fig. 1(c) compute group: "512b xbar"'),
+        (quadrant_s1_ctrl_xbars["soc_to_quad"], "group_ctrl_from_chiplet_xbar",
+         'Fig. 1(c) compute group: in "CLK, Rst Gate Control", from the chiplet'),
+        (quadrant_s1_ctrl_xbars["quad_to_soc"], "group_ctrl_to_chiplet_xbar",
+         'Fig. 1(c) compute group: in "CLK, Rst Gate Control", to the chiplet'),
+    ] + [(pre, "chiplet_group{}_demux".format(i),
+          "Fig. 1(d) chiplet: demux below compute group {}".format(i))
+         for i, pre in enumerate(quadrant_pre_xbars)]:
+        xbar.axi4_label, xbar.axi4_note = label, note
+
     # Networks of crossbars generated as one AXI4-dialect module each, with the cuts and ID
     # remappers that sit next to a crossbar in the templates.
     cuts = occamy.cfg["cuts"]
     txns = occamy.cfg["txns"]
     Net = solder.Axi4Network
 
-    soc_narrow = Net("soc_narrow", "soc", [soc_narrow_xbar])
+    soc_narrow = Net("soc_narrow", "soc", [soc_narrow_xbar], "chiplet_64b",
+                     "Fig. 1(d) chiplet, 64b side: the 64b xbar and the cuts on its ports")
     for i in range(nr_s1_quadrants):
         soc_narrow.add_chain(soc_narrow_xbar, "out_s1_quadrant_{}".format(i),
                              Net.cuts(cuts["narrow_to_quad"]))
@@ -921,7 +942,9 @@ def main():
     soc_narrow.add_chain(soc_narrow_xbar, "out_spm_narrow",
                          Net.cuts(cuts["narrow_conv_to_spm_narrow_pre"]))
 
-    soc_wide = Net("soc_wide", "soc", quadrant_pre_xbars + [quadrant_inter_xbar, soc_wide_xbar])
+    soc_wide = Net("soc_wide", "soc", quadrant_pre_xbars + [quadrant_inter_xbar, soc_wide_xbar],
+                   "chiplet_512b", "Fig. 1(d) chiplet, 512b side: System xbar, Group xbar and the "
+                   "demux below each compute group, with the cuts and ID remappers between them")
     for i, pre in enumerate(quadrant_pre_xbars):
         soc_wide.add_chain(pre, "in_quadrant", Net.cuts(cuts["quad_to_pre"]))
         soc_wide.add_link(pre, "quadrant_inter_xbar", quadrant_inter_xbar,
@@ -987,16 +1010,23 @@ def main():
                                                          cxb.addr_width)
                     addrmaps.append([(x.outputs.index(sub), windows[w][0], windows[w][1] + 1)
                                      for sub, ws in subs.items() for w in ws])
-                x.axi4_variants = {"param": "TileId", "signal": "tile_id_i", "addrmaps": addrmaps}
+                x.axi4_variants = {"param": "TileId", "suffix": "tile", "signal": "tile_id_i",
+                                   "addrmaps": addrmaps}
+                x.axi4_label = "cluster{}_{}b_xbar".format(j, s["data_width"])
+                x.axi4_note = 'Fig. 1(a) compute cluster {}: "{}b xbar"'.format(j, s["data_width"])
                 cluster_xbars[j][side] = x
 
         # The cluster's own cuts on its external ports.
         ext_cuts = {side: Net.cuts(int(cluster["timing"]["register_ext_" + side]))
                     for side in ("narrow", "wide")}
         quadrant_narrow = Net("quadrant_narrow", "quadrant_s1", [narrow_xbar_quadrant_s1] +
-                              [c["narrow"] for c in cluster_xbars])
+                              [c["narrow"] for c in cluster_xbars], "group_64b",
+                              "Fig. 1(c) compute group, 64b side: its 64b xbar and the 64b xbars "
+                              "of its compute clusters (Fig. 1(a))")
         quadrant_wide = Net("quadrant_wide", "quadrant_s1", [wide_xbar_quadrant_s1] +
-                            [c["wide"] for c in cluster_xbars])
+                            [c["wide"] for c in cluster_xbars], "group_512b",
+                            "Fig. 1(c) compute group, 512b side: its 512b xbar and the 512b xbars "
+                            "of its compute clusters (Fig. 1(a))")
         quadrant_narrow.add_chain(
             narrow_xbar_quadrant_s1, "in_top",
             Net.change_iw(soc_narrow_xbar.iw_out(), narrow_xbar_quadrant_s1.iw, 4),
