@@ -1618,10 +1618,10 @@ class AxiXbar(Xbar):
                 "outstanding_reads = {n}{}").format(
                     self.aw, self.dw, " {pulp.atops}" if self.atop_support else "", n=1 << iw)
 
-    def axi4_xbar_op(self, result, mgrs):
+    def axi4_xbar_op(self, result, mgrs, latency_mode=None):
         note = "  // {} (`{}`)\n".format(self.axi4_note, self.name) if self.axi4_note else ""
         pulp_cfg = [
-            "PULP_CONFIG_LatencyMode = \"{}\"".format(self.latency_mode),
+            "PULP_CONFIG_LatencyMode = \"{}\"".format(latency_mode or self.latency_mode),
             "PULP_CONFIG_MaxSlvTrans = {} : i32".format(self.max_slv_trans),
             "PULP_CONFIG_MaxMstTrans = {} : i32".format(self.max_mst_trans),
             "PULP_CONFIG_FallThrough = {}".format(str(bool(self.fall_through)).lower()),
@@ -2031,8 +2031,32 @@ class Axi4Network(object):
                 return dst, di, ops
         return None
 
+    def link_ops(self, x, link):
+        """Ops along a link from `x`, with both crossbars' port registers as cuts."""
+        return self.in_ops(link[0], self.out_ops(x, link[2]))
+
     def linked_inputs(self):
         return {(dst, di) for _, _, dst, di in self.links}
+
+    # The latency modes whose registers are cuts on whole ports: (inputs, outputs).
+    PORT_CUTS = {
+        "axi_pkg::NO_LATENCY": (False, False),
+        "axi_pkg::CUT_SLV_PORTS": (True, False),
+        "axi_pkg::CUT_MST_PORTS": (False, True),
+        "axi_pkg::CUT_ALL_PORTS": (True, True),
+    }
+
+    def in_ops(self, x, ops):
+        """`ops` into an input of `x`, followed by the crossbar's own register as a cut."""
+        return ops + self.cuts(int(self.PORT_CUTS.get(x.latency_mode, (0, 0))[0]))
+
+    def out_ops(self, x, ops):
+        """`ops` from an output of `x`, after the crossbar's own register as a cut."""
+        return self.cuts(int(self.PORT_CUTS.get(x.latency_mode, (0, 0))[1])) + ops
+
+    def latency_mode(self, x):
+        """`x`'s latency mode once its port registers are cuts; others stay inside it."""
+        return "axi_pkg::NO_LATENCY" if x.latency_mode in self.PORT_CUTS else None
 
     @staticmethod
     def apply(base, ops, value, iw):
@@ -2089,8 +2113,8 @@ class Axi4Network(object):
                 iw = self.ext_iw(x, "in", i)
                 code += "  %{n}, %{n}_access = axi4.dummies.ext_manager \"{n}\" %clk, %rst_ni " \
                     "{}\n".format(x.axi4_port_attrs(iw), n=n)
-                ops_code, mgrs[(x, i)], iw = self.apply(n, self.chains.get((x, "in_" + i), []),
-                                                        "%" + n, iw)
+                ops_code, mgrs[(x, i)], iw = self.apply(
+                    n, self.in_ops(x, self.chains.get((x, "in_" + i), [])), "%" + n, iw)
                 assert iw == x.iw, "{}: `{}` reaches `{}` with a {}-bit ID".format(
                     self.name, n, x.axi4_name(), iw)
                 code += ops_code
@@ -2100,9 +2124,11 @@ class Axi4Network(object):
                 link = self.link_from(x, o)
                 if link:
                     n = "{}_out_{}".format(x.axi4_name(), o)
-                    mgrs[(link[0], link[1])] = self.apply(n, link[2], "%" + x.axi4_name(), 0)[1]
+                    mgrs[(link[0], link[1])] = self.apply(n, self.link_ops(x, link), "%" +
+                                                          x.axi4_name(), 0)[1]
         for x in self.members:
-            code += x.axi4_xbar_op("%" + x.axi4_name(), [mgrs[(x, i)] for i in x.inputs])
+            code += x.axi4_xbar_op("%" + x.axi4_name(), [mgrs[(x, i)] for i in x.inputs],
+                                   self.latency_mode(x))
             windows = x.axi4_windows(self.addrmap(x, variant))
             # Downstream ports are numbered in use-list order, which is reverse creation order;
             # keep solder's numbering.
@@ -2110,13 +2136,15 @@ class Axi4Network(object):
                 n = "{}_out_{}".format(x.axi4_name(), o)
                 link = self.link_from(x, o)
                 if link:
-                    ops_code, _, iw = self.apply(n, link[2], "%" + x.axi4_name(), x.iw_out())
+                    ops_code, _, iw = self.apply(n, self.link_ops(x, link), "%" + x.axi4_name(),
+                                                 x.iw_out())
                     assert iw == link[0].iw, "{}: `{}.{}` reaches `{}.{}` with a {}-bit ID" \
                         .format(self.name, x.name, o, link[0].name, link[1], iw)
                     code += ops_code
                     continue
-                ops_code, value, iw = self.apply(n, self.chains.get((x, "out_" + o), []),
-                                                 "%" + x.axi4_name(), x.iw_out())
+                ops_code, value, iw = self.apply(
+                    n, self.out_ops(x, self.chains.get((x, "out_" + o), [])), "%" + x.axi4_name(),
+                    x.iw_out())
                 code += ops_code
                 code += "  %{n}_access = axi4.dummies.ext_subordinate \"{n}\" %clk, %rst_ni, " \
                     "{}\n    windows <{}>\n    {}\n".format(
