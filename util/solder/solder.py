@@ -1714,7 +1714,8 @@ class AxiXbar(Xbar):
                 "bits": bits,
                 "inputs": self.inputs,
                 "outputs": self.outputs,
-                "user_width": self.uw
+                # PULP structs carry at least one user bit, which `axi_xbar` passes through.
+                "user_width": max(self.uw, 1)
             }
 
     def emit_axi4_instance(self, input_enums, output_enums):
@@ -2181,11 +2182,10 @@ class Axi4Network(object):
         checks = dict()
         linked = self.linked_inputs()
         # PULP structs carry at least one user bit, which `axi_xbar` passes through.
-        uw = max(x.uw for x in self.members)
+        uw = max(max(x.uw for x in self.members), 1)
         for x in self.members:
             x.axi4_check()
-            assert (x.clk, x.rst, max(x.uw, 1), x.context) == \
-                (x0.clk, x0.rst, max(uw, 1), self.context)
+            assert (x.clk, x.rst, max(x.uw, 1), x.context) == (x0.clk, x0.rst, uw, self.context)
             boundary = [("in", i) for i in x.inputs if (x, i) not in linked]
             boundary += [("out", o) for o in x.outputs if not self.link_from(x, o)]
             for kind, p in boundary:
