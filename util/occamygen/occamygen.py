@@ -921,34 +921,74 @@ def main():
          for i, pre in enumerate(quadrant_pre_xbars)]:
         xbar.axi4_label, xbar.axi4_note = label, note
 
-    # Requests per ID, as (reads, writes), that the endpoints behind external ports accept,
-    # where they are known, counting what the cuts between the port and the endpoint hold
-    # (`occamy_soc.sv.tpl`). The endpoints are in order, so one ID may use all of their budget.
-    # Other ports keep the crossbar's count.
-    # Each cut is a spill register per channel, which holds two requests.
-    held_by_cuts = lambda n: 2 * n  # noqa: E731
-    # CVA6: three single-request AXI adapters (instruction fetch, data refill and writeback,
-    # bypass), each on its own ID.
-    soc_narrow_xbar.axi4_ext[("in", "cva6")] = (1, 1)
-    # The system iDMA, `NumAxInFlight`.
-    soc_wide_xbar.axi4_ext[("in", "sys_idma_mst")] = (64, 64)
-    # The narrow SPM's `axi_riscv_atomics` (`max_atomics_narrow`, 8 of each) holds each
-    # request until its response; the memory behind it holds no more.
-    soc_narrow_xbar.axi4_ext[("out", "spm_narrow")] = (8, 8)
-    # `axi_to_mem_interleaved` with `BufDepth` 16: an `axi_to_detailed_mem` for each direction,
-    # whose request buffer holds `1 + BufDepth`.
-    soc_wide_xbar.axi4_ext[("out", "spm_wide")] = (17, 17)
-    # `axi_zero_mem` with `BufDepth` 4: one `axi_to_detailed_mem` for reads and writes.
-    soc_wide_xbar.axi4_ext[("out", "wide_zero_mem")] = (5, 5)
-    # `axi_to_axi_lite` in `occamy_top` (4 of each), behind the cuts that stay outside the
-    # network.
-    for port, c in [("periph", "periph_axi_lite"),
-                    ("axi_lite_narrow_periph", "periph_axi_lite_narrow")]:
-        n = 4 + held_by_cuts(occamy.cfg["cuts"][c])
-        soc_narrow_xbar.axi4_ext[("out", port)] = (n, n)
-    # The downsizer to 32 bits (`AxiMaxReads` 1), then `axi_to_reg` (2 writes); the downsizer
-    # converts one write burst at a time but does not hold it until its response.
-    soc_narrow_xbar.axi4_ext[("out", "sys_idma_cfg")] = (1, 2)
+    # Requests per ID, as (reads, writes), that the managers behind external ports issue with
+    # one ID. The subordinates and the crossbars keep the crossbar's count, for the
+    # optimization to derive.
+    dma_in_flight = occamy.cluster.cfg["dma_axi_req_fifo_depth"]
+    mgr_per_id = {
+        # CVA6: three single-request AXI adapters (instruction fetch, data refill and writeback,
+        # bypass), each on its own ID.
+        "cva6": (1, 1),
+        # PCIe: at most one read and one write.
+        "pcie": (1, 1),
+        # The debug module's system bus access, through `axi_lite_from_mem` (`MaxRequests` 2).
+        "periph": (2, 2),
+        # The system iDMA backend, on ID 0: `NumAxInFlight` 64 reads, and writes up to its
+        # `MetaFifoDepth`, `BufferDepth` 3 + `NumAxInFlight` 64 + `MemSysDepth` 16.
+        "sys_idma_mst": (64, 3 + 64 + 16),
+        # A cluster's cores and page-table walker: `reqrsp_to_axi` (`MaxTrans` 4) stalls at 3.
+        "core": (3, 3),
+        "ptw": (3, 3),
+        # A cluster's DMA backend, on ID 0 (`idma_inst64_top`, one channel): `NumAxInFlight`
+        # reads, and writes up to `BufferDepth` 3 + `NumAxInFlight` + `MemSysDepth` 16.
+        "dma": (dma_in_flight, 3 + dma_in_flight + 16),
+        # The instruction cache refill (`TransactionQueueDepth` 4) only reads; the dialect
+        # takes at least one write.
+        "icache_0": (4, 1),
+    }
+    for port in ("cva6", "pcie", "periph"):
+        soc_narrow_xbar.axi4_ext[("in", port)] = mgr_per_id[port]
+    soc_wide_xbar.axi4_ext[("in", "sys_idma_mst")] = mgr_per_id["sys_idma_mst"]
+    # The largest per ID of the managers on the narrow side.
+    narrow_per_id = tuple(
+        max(c) for c in zip(*[mgr_per_id[m] for m in ("core", "ptw", "cva6", "pcie", "periph")]))
+    # HBI links two Occamy dies, so the requests per ID arriving on it are those the other
+    # die's `out_hbi` carries: what reaches that port, capped by its crossbar's budget.
+    # Narrow: the cores and page-table walkers (3), as the remappers out of the quadrants keep
+    # IDs apart, the managers above, and wide traffic, which arrives through the downsizer to
+    # the narrow side (`AxiMaxReads` 1, a 1-deep B queue). No-loopback keeps out HBI itself.
+    soc_narrow_xbar.axi4_ext[("in", "hbi")] = tuple(
+        min(soc_narrow_xbar.axi4_per_id(), max(c, 1)) for c in narrow_per_id)
+    # Wide: the system iDMA alone exceeds the crossbar's budget.
+    soc_wide_xbar.axi4_ext[("in", "hbi")] = tuple(
+        min(soc_wide_xbar.axi4_per_id(), c) for c in mgr_per_id["sys_idma_mst"])
+
+    # The ports through which traffic enters one network from the rest of Occamy, which act as
+    # its managers, carry what the managers upstream issue. Crossbars keep each manager's IDs
+    # apart, and the ID converters between networks are one-to-one remappers, which also cap
+    # the requests per ID at their `max_txns_per_id`.
+    # Narrow traffic into the quadrants, and out of them through the controller.
+    for x in quadrant_s1_ctrl_xbars.values():
+        x.axi4_ext[("in", "in")] = narrow_per_id
+    narrow_xbar_quadrant_s1.axi4_ext[("in", "top")] = narrow_per_id
+    for i in range(nr_s1_quadrants):
+        soc_narrow_xbar.axi4_ext[("in", "s1_quadrant_{}".format(i))] = narrow_per_id
+    # Wide traffic into the narrow side passes the downsizer (`AxiMaxReads` 1, a 1-deep B
+    # queue).
+    soc_narrow_xbar.axi4_ext[("in", "soc_wide")] = (1, 1)
+    # Narrow traffic into the wide side passes the AMO adapter, which turns each atomic into a
+    # write and a read, so reads take the writes on top.
+    soc_wide_xbar.axi4_ext[("in", "soc_narrow")] = (narrow_per_id[0] + narrow_per_id[1],
+                                                   narrow_per_id[1])
+    # Wide traffic out of a quadrant: its DMAs' writes, capped by the quadrant's crossbar, and
+    # reads that its read-only cache may refill on one ID, capped only by the remapper.
+    wide_trans = occamy.cfg["s1_quadrant"]["wide_trans"]
+    for pre in quadrant_pre_xbars:
+        pre.axi4_ext[("in", "quadrant")] = (
+            wide_trans, min(wide_xbar_quadrant_s1.axi4_per_id(), mgr_per_id["dma"][1]))
+    # Wide traffic into a quadrant: the system iDMA fills the wide crossbars' budgets.
+    wide_into_quadrant = min(soc_wide_xbar.axi4_per_id(), quadrant_inter_xbar.axi4_per_id())
+    wide_xbar_quadrant_s1.axi4_ext[("in", "top")] = (wide_into_quadrant, ) * 2
 
     # Networks of crossbars generated as one AXI4-dialect module each, with the cuts and ID
     # remappers that sit next to a crossbar in the templates.
@@ -1043,6 +1083,9 @@ def main():
                                    "addrmaps": addrmaps}
                 x.axi4_label = "cluster{}_{}b_xbar".format(j, s["data_width"])
                 x.axi4_note = 'Fig. 1(a) compute cluster {}: "{}b xbar"'.format(j, s["data_width"])
+                for m in s["mgrs"]:
+                    if m in mgr_per_id:
+                        x.axi4_ext[("in", m)] = mgr_per_id[m]
                 cluster_xbars[j][side] = x
 
         # The cluster's own cuts on its external ports.
