@@ -1516,6 +1516,9 @@ class AxiXbar(Xbar):
         # Name in the AXI4-dialect descriptions, and a comment placing it in the design.
         self.axi4_label = None
         self.axi4_note = None
+        # `(kind, port)` -> `(reads, writes)` per ID that the endpoint behind an external port
+        # accepts, where that differs from the crossbar's.
+        self.axi4_ext = dict()
 
     def add_input(self, name, outputs=None):
         self.inputs.append(name)
@@ -1614,16 +1617,20 @@ class AxiXbar(Xbar):
         """Requests per ID each input admits; the lowering sets `MaxMstTrans` to this plus one."""
         return self.max_mst_trans - 1
 
-    def axi4_port_attrs(self, iw):
-        """Attributes of an external port with an `iw`-bit ID."""
-        # The lowering sizes each port's ID as `clog2(outstanding_*_ids)`. Occamy has no
-        # per-endpoint counts per ID, so endpoints match the crossbar. Every port may carry
+    def axi4_port_attrs(self, iw, kind=None, port=None):
+        """Attributes of an external port with an `iw`-bit ID.
+
+        `axi4_ext` gives the requests per ID that the endpoint behind a port (`kind` "in" or
+        "out", and its name) accepts, as `(reads, writes)`; the other ports match the crossbar.
+        The ID count stays `1 << iw`, which sizes the port's ID."""
+        # The lowering sizes each port's ID as `clog2(outstanding_*_ids)`. Every port may carry
         # atomics, as through `axi_xbar`; the PULP lowering sets `ATOPs` from these markers.
+        reads, writes = self.axi4_ext.get((kind, port), (self.axi4_per_id(), ) * 2)
         return ("addr_width = {}, data_width = {}, outstanding_write_ids = {n}, "
-                "outstanding_read_ids = {n}, concurrent_writes_per_id = {p}, "
-                "concurrent_reads_per_id = {p}{}").format(
+                "outstanding_read_ids = {n}, concurrent_writes_per_id = {w}, "
+                "concurrent_reads_per_id = {r}{}").format(
                     self.aw, self.dw, " {pulp.atops}" if self.atop_support else "", n=1 << iw,
-                    p=self.axi4_per_id())
+                    r=reads, w=writes)
 
     # The latency modes whose registers are cuts on whole ports: (inputs, outputs).
     PORT_CUTS = {
@@ -1687,7 +1694,7 @@ class AxiXbar(Xbar):
             mgrs = []
             for i in self.inputs:
                 code += "  %in_{i}, %in_{i}_access = axi4.dummies.ext_manager \"in_{i}\" " \
-                    "%clk, %rst_ni {}\n".format(widths(self.iw), i=i)
+                    "%clk, %rst_ni {}\n".format(widths(self.iw, "in", i), i=i)
                 cut_code, mgr, _ = Axi4Network.apply("in_" + i, in_cuts, "%in_" + i, self.iw)
                 code += cut_code
                 mgrs.append(mgr)
@@ -1700,7 +1707,8 @@ class AxiXbar(Xbar):
                 code += cut_code
                 code += "  %out_{o}_access = axi4.dummies.ext_subordinate \"out_{o}\" " \
                     "%clk, %rst_ni, {}\n    windows <{}>\n    {}\n".format(
-                        sub, ", ".join(window(*w) for w in ws), widths(self.iw_out()), o=o)
+                        sub, ", ".join(window(*w) for w in ws),
+                        widths(self.iw_out(), "out", o), o=o)
             for i in self.inputs:
                 for o, ws in zip(self.outputs, windows):
                     if not self.connected(i, o):
@@ -2129,7 +2137,7 @@ class Axi4Network(object):
                 n = "{}_in_{}".format(x.axi4_name(), i)
                 iw = self.ext_iw(x, "in", i)
                 code += "  %{n}, %{n}_access = axi4.dummies.ext_manager \"{n}\" %clk, %rst_ni " \
-                    "{}\n".format(x.axi4_port_attrs(iw), n=n)
+                    "{}\n".format(x.axi4_port_attrs(iw, "in", i), n=n)
                 ops_code, mgrs[(x, i)], iw = self.apply(
                     n, self.in_ops(x, self.chains.get((x, "in_" + i), [])), "%" + n, iw)
                 assert iw == x.iw, "{}: `{}` reaches `{}` with a {}-bit ID".format(
@@ -2164,8 +2172,8 @@ class Axi4Network(object):
                 code += ops_code
                 code += "  %{n}_access = axi4.dummies.ext_subordinate \"{n}\" %clk, %rst_ni, " \
                     "{}\n    windows <{}>\n    {}\n".format(
-                        value, ", ".join(x.axi4_window(*w) for w in ws), x.axi4_port_attrs(iw),
-                        n=n)
+                        value, ", ".join(x.axi4_window(*w) for w in ws),
+                        x.axi4_port_attrs(iw, "out", o), n=n)
         for (x, i), (y, o), rs in self.routes(variant):
             for r in rs:
                 code += "  axi4.dummies.accesses %{}_in_{}_access -> %{}_out_{}_access " \
