@@ -921,6 +921,35 @@ def main():
          for i, pre in enumerate(quadrant_pre_xbars)]:
         xbar.axi4_label, xbar.axi4_note = label, note
 
+    # Requests per ID, as (reads, writes), that the endpoints behind external ports accept,
+    # where they are known, counting what the cuts between the port and the endpoint hold
+    # (`occamy_soc.sv.tpl`). The endpoints are in order, so one ID may use all of their budget.
+    # Other ports keep the crossbar's count.
+    # Each cut is a spill register per channel, which holds two requests.
+    held_by_cuts = lambda n: 2 * n  # noqa: E731
+    # CVA6: three single-request AXI adapters (instruction fetch, data refill and writeback,
+    # bypass), each on its own ID.
+    soc_narrow_xbar.axi4_ext[("in", "cva6")] = (1, 1)
+    # The system iDMA, `NumAxInFlight`.
+    soc_wide_xbar.axi4_ext[("in", "sys_idma_mst")] = (64, 64)
+    # The narrow SPM's `axi_riscv_atomics` (`max_atomics_narrow`, 8 of each) holds each
+    # request until its response; the memory behind it holds no more.
+    soc_narrow_xbar.axi4_ext[("out", "spm_narrow")] = (8, 8)
+    # `axi_to_mem_interleaved` with `BufDepth` 16: an `axi_to_detailed_mem` for each direction,
+    # whose request buffer holds `1 + BufDepth`.
+    soc_wide_xbar.axi4_ext[("out", "spm_wide")] = (17, 17)
+    # `axi_zero_mem` with `BufDepth` 4: one `axi_to_detailed_mem` for reads and writes.
+    soc_wide_xbar.axi4_ext[("out", "wide_zero_mem")] = (5, 5)
+    # `axi_to_axi_lite` in `occamy_top` (4 of each), behind the cuts that stay outside the
+    # network.
+    for port, c in [("periph", "periph_axi_lite"),
+                    ("axi_lite_narrow_periph", "periph_axi_lite_narrow")]:
+        n = 4 + held_by_cuts(occamy.cfg["cuts"][c])
+        soc_narrow_xbar.axi4_ext[("out", port)] = (n, n)
+    # The downsizer to 32 bits (`AxiMaxReads` 1), then `axi_to_reg` (2 writes); the downsizer
+    # converts one write burst at a time but does not hold it until its response.
+    soc_narrow_xbar.axi4_ext[("out", "sys_idma_cfg")] = (1, 2)
+
     # Networks of crossbars generated as one AXI4-dialect module each, with the cuts and ID
     # remappers that sit next to a crossbar in the templates.
     cuts = occamy.cfg["cuts"]
